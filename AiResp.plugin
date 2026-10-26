@@ -18,9 +18,9 @@ from android.net import Uri
 
 __id__ = "autoresp"
 __name__ = "AutoResp — Gemini AI"
-__description__ = "AI-автоответчик для Telegram через Gemini API с надёжной обработкой входящих сообщений, очередью ответов, диагностикой и расписанием."
+__description__ = "AI-автоответчик для Telegram через Gemini API с надёжной обработкой входящих сообщений, очередью ответов, повторами сети и диагностикой."
 __author__ = "@h0nkey"
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.4.3"
@@ -82,13 +82,13 @@ class AutoRespPlugin(BasePlugin):
             Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
             Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
             Divider(),
-            Text(text="AutoResp 1.0.8 • Gemini REST", subtext="Каждое принятое входящее сообщение ставится в отдельную очередь ответа"),
+            Text(text="AutoResp 1.0.9 • Gemini REST", subtext="Каждое принятое входящее сообщение получает отдельную задачу ответа"),
         ]
 
     def on_plugin_load(self):
         for name in ("TL_updateNewMessage", "TL_updateNewChannelMessage", "TL_updateShortMessage", "TL_updateShortChatMessage"):
             self.add_hook(name)
-        self.logger.info("AutoResp 1.0.8 loaded")
+        self.logger.info("AutoResp 1.0.9 loaded")
 
     def on_plugin_unload(self):
         with self._lock:
@@ -173,9 +173,7 @@ class AutoRespPlugin(BasePlugin):
         if message is None or dialog_id is None:
             return HookResult()
         text = getattr(message, "message", None)
-        if not isinstance(text, str) or not text.strip():
-            return HookResult()
-        if bool(getattr(message, "out", False)):
+        if not isinstance(text, str) or not text.strip() or bool(getattr(message, "out", False)):
             return HookResult()
         message_id = int(getattr(message, "id", 0) or 0)
         if message_id == 0:
@@ -280,13 +278,26 @@ class AutoRespPlugin(BasePlugin):
 
     @staticmethod
     def _gemini_post(base: str, model: str, api_key: str, payload: Dict[str, Any]):
-        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "exteraGram-AutoResp/1.0.8"}
-        r = requests.post(f"{base}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
-        if r.status_code == 404 and base == GEMINI_BASES[0]:
-            r2 = requests.post(f"{GEMINI_BASES[1]}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
-            if r2.status_code != 404:
-                return r2
-        return r
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "exteraGram-AutoResp/1.0.9"}
+        last = None
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{base}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
+                if r.status_code == 404 and base == GEMINI_BASES[0]:
+                    r2 = requests.post(f"{GEMINI_BASES[1]}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
+                    if r2.status_code != 404:
+                        return r2
+                    r = r2
+                if r.status_code not in (408, 429, 500, 502, 503, 504):
+                    return r
+                last = r
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        return last
 
     @staticmethod
     def _extract_text(data: Dict[str, Any]) -> str:
@@ -317,7 +328,7 @@ class AutoRespPlugin(BasePlugin):
         return None
 
     def _allowed_dialog(self, dialog_id: int) -> bool:
-        if bool(self.get_setting("private_only", True)):
+        if bool(self.get_setting("private_only", True):
             return dialog_id > 0
         if dialog_id > 0:
             return True
