@@ -1,1 +1,572 @@
-PLACEHOLDER
+from __future__ import annotations
+
+import datetime as dt
+import threading
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult
+from client_utils import EXTERNAL_NETWORK_QUEUE, run_on_queue, send_text
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
+
+
+__id__ = "autoresp"
+__name__ = "AutoResp"
+__description__ = "AI-автоответчик для личных сообщений через Gemini API."
+__author__ = "romanludenberg17-bit"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.5.0"
+
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_PROMPT = (
+    "ты — мой личный автоответчик в Telegram. "
+    "отвечай естественно, коротко и по-человечески. "
+    "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
+    "не выдумывай факты обо мне. "
+    "учитывай контекст предыдущих сообщений. "
+    "если сообщение не требует ответа, дай короткую вежливую реакцию."
+)
+
+QUALITY = {
+    0: {"name": "Экономный", "tokens": 384, "temperature": 0.55},
+    1: {"name": "Рекомендуемый", "tokens": 768, "temperature": 0.70},
+    2: {"name": "Усиленный", "tokens": 1536, "temperature": 0.80},
+}
+
+
+class AutoRespPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._busy: set[Tuple[int, int]] = set()
+        self._seen: set[Tuple[int, int, int]] = set()
+        self._context: Dict[Tuple[int, int], List[Tuple[str, str]]] = {}
+        self._model_cache: Dict[str, Tuple[str, float]] = {}
+        self._lock = threading.RLock()
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="AutoResp"),
+            Switch(
+                key="enabled",
+                text="Включить автоответчик",
+                subtext="Отвечает на новые входящие сообщения",
+                default=False,
+            ),
+            Text(
+                text="? Как это работает",
+                icon="msg_help",
+                on_click=lambda _view: self._show_help(),
+            ),
+            Divider(text="Gemini"),
+            Input(
+                key="api_key",
+                text="Gemini API key",
+                default="",
+                subtext="ключ хранится в настройках плагина и не попадает в GitHub",
+            ),
+            Selector(
+                key="quality",
+                text="Режим качества",
+                items=["Экономный", "Рекомендуемый", "Усиленный"],
+                default=1,
+            ),
+            Input(
+                key="model",
+                text="Модель",
+                default="auto",
+                subtext="auto — плагин сам выберет подходящую модель",
+            ),
+            EditText(
+                key="prompt",
+                hint="Системный промпт",
+                default=DEFAULT_PROMPT,
+                multiline=True,
+                max_length=6000,
+            ),
+            Text(
+                text="Проверить Gemini API",
+                icon="msg_check",
+                on_click=lambda _view: self._test_api(),
+            ),
+            Divider(text="Автоответчик"),
+            Switch(
+                key="private_only",
+                text="Только личные сообщения",
+                subtext="Группы и каналы игнорируются",
+                default=True,
+            ),
+            Switch(
+                key="reply_to_groups",
+                text="Отвечать в группах",
+                subtext="Работает только если выключен режим «только личные»",
+                default=False,
+            ),
+            Input(
+                key="delay_min",
+                text="Минимальная задержка, сек",
+                default="2",
+            ),
+            Input(
+                key="delay_max",
+                text="Максимальная задержка, сек",
+                default="5",
+            ),
+            Input(
+                key="context_count",
+                text="Сообщений контекста",
+                default="8",
+            ),
+            Divider(text="Расписание"),
+            Selector(
+                key="schedule_mode",
+                text="Когда отвечать",
+                items=["Всегда", "По расписанию"],
+                default=0,
+            ),
+            Input(
+                key="start_date",
+                text="Дата начала",
+                default="",
+                subtext="YYYY-MM-DD; пусто — без ограничения",
+            ),
+            Input(
+                key="end_date",
+                text="Дата окончания",
+                default="",
+                subtext="YYYY-MM-DD; пусто — без ограничения",
+            ),
+            Input(
+                key="start_time",
+                text="Время начала",
+                default="00:00",
+                subtext="HH:MM",
+            ),
+            Input(
+                key="end_time",
+                text="Время окончания",
+                default="23:59",
+                subtext="HH:MM",
+            ),
+            Divider(),
+            Text(
+                text="AutoResp 1.0.0 • Gemini REST • без собственного сервера",
+                subtext="API-запросы выполняются прямо с телефона",
+            ),
+        ]
+
+    def on_plugin_load(self):
+        self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_updateNewChannelMessage")
+        self.add_hook("TL_updateNewScheduledMessage")
+        self.logger.info("AutoResp loaded")
+
+    def on_plugin_unload(self):
+        with self._lock:
+            self._busy.clear()
+            self._seen.clear()
+            self._context.clear()
+            self._model_cache.clear()
+        self.logger.info("AutoResp unloaded")
+
+    def on_update_hook(
+        self, update_name: str, account: int, update: Any
+    ) -> HookResult:
+        if update_name not in (
+            "TL_updateNewMessage",
+            "TL_updateNewChannelMessage",
+            "TL_updateNewScheduledMessage",
+        ):
+            return HookResult()
+
+        if not self.get_setting("enabled", False):
+            return HookResult()
+
+        message = getattr(update, "message", None)
+        if message is None:
+            return HookResult()
+
+        text = getattr(message, "message", None)
+        if not isinstance(text, str) or not text.strip():
+            return HookResult()
+
+        if bool(getattr(message, "out", False)):
+            return HookResult()
+
+        message_id = int(getattr(message, "id", 0) or 0)
+        dialog_id = self._dialog_id(message)
+        if dialog_id is None or message_id == 0:
+            return HookResult()
+
+        seen_key = (int(account), int(dialog_id), message_id)
+        with self._lock:
+            if seen_key in self._seen:
+                return HookResult()
+            self._seen.add(seen_key)
+            if len(self._seen) > 4000:
+                self._seen = set(list(self._seen)[-2000:])
+
+        if not self._allowed_dialog(dialog_id, message):
+            return HookResult()
+
+        if not self._schedule_allowed():
+            return HookResult()
+
+        self._remember(account, dialog_id, "user", text)
+
+        delay = self._delay_seconds()
+        key = (int(account), int(dialog_id))
+        with self._lock:
+            if key in self._busy:
+                return HookResult()
+            self._busy.add(key)
+
+        run_on_queue(
+            lambda: self._generate_and_reply(
+                account=account,
+                dialog_id=dialog_id,
+                incoming=text,
+                message_id=message_id,
+            ),
+            EXTERNAL_NETWORK_QUEUE,
+            int(delay * 1000),
+        )
+        return HookResult()
+
+    def _generate_and_reply(
+        self,
+        account: int,
+        dialog_id: int,
+        incoming: str,
+        message_id: int,
+    ):
+        key = (int(account), int(dialog_id))
+        try:
+            api_key = str(self.get_setting("api_key", "") or "").strip()
+            if not api_key:
+                self.logger.warning("Gemini API key is empty")
+                return
+
+            model = self._resolve_model(api_key)
+            if not model:
+                raise RuntimeError("Не удалось подобрать модель Gemini")
+
+            quality_index = int(self.get_setting("quality", 1) or 1)
+            quality = QUALITY.get(quality_index, QUALITY[1])
+            context_count = self._int_setting("context_count", 8, 1, 20)
+            history = self._get_context(account, dialog_id, context_count)
+            system_prompt = str(
+                self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT
+            ).strip()
+
+            history_text = []
+            for role, item_text in history:
+                label = "пользователь" if role == "user" else "я"
+                history_text.append(f"{label}: {item_text}")
+
+            user_prompt = (
+                "сгенерируй только готовый ответ на последнее сообщение.\n\n"
+                "контекст:\n"
+                + ("\n".join(history_text) if history_text else "(нет контекста)")
+                + "\n\nпоследнее сообщение пользователя:\n"
+                + incoming
+            )
+
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": {
+                    "temperature": quality["temperature"],
+                    "maxOutputTokens": quality["tokens"],
+                },
+            }
+
+            response = requests.post(
+                f"{GEMINI_BASE}/{model}:generateContent",
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=45,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"Gemini HTTP {response.status_code}: "
+                    f"{self._short_error(response.text)}"
+                )
+
+            answer = self._extract_text(response.json()).strip()
+            if not answer:
+                raise RuntimeError("Gemini вернул пустой ответ")
+            if len(answer) > 4096:
+                answer = answer[:4093].rstrip() + "..."
+
+            if not self._still_latest(account, dialog_id, message_id):
+                return
+
+            send_text(dialog_id, answer, account=account)
+            self._remember(account, dialog_id, "assistant", answer)
+            self.logger.info(
+                "Auto reply sent: account=%s dialog=%s model=%s",
+                account,
+                dialog_id,
+                model,
+            )
+        except Exception:
+            self.logger.exception("AutoResp generation failed")
+        finally:
+            with self._lock:
+                self._busy.discard(key)
+
+    def _resolve_model(self, api_key: str) -> Optional[str]:
+        manual = str(self.get_setting("model", "auto") or "auto").strip()
+        if manual and manual.lower() != "auto":
+            return manual.replace("models/", "")
+
+        cached = self._model_cache.get("auto")
+        now = time.time()
+        if cached and cached[1] > now:
+            return cached[0]
+
+        response = requests.get(
+            f"{GEMINI_BASE}/models",
+            headers={"x-goog-api-key": api_key},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Не удалось получить список моделей: HTTP {response.status_code}"
+            )
+
+        models = response.json().get("models", [])
+        candidates = []
+        for item in models:
+            name = str(item.get("name", "")).replace("models/", "")
+            methods = item.get("supportedGenerationMethods", [])
+            if not name or "generateContent" not in methods:
+                continue
+            low = name.lower()
+            if any(x in low for x in ("embedding", "image", "tts", "live", "aqa")):
+                continue
+            candidates.append(name)
+
+        if not candidates:
+            return None
+
+        def score(name: str) -> Tuple[int, str]:
+            low = name.lower()
+            if "flash-lite" in low:
+                rank = 0
+            elif "flash" in low:
+                rank = 1
+            elif "pro" in low:
+                rank = 2
+            else:
+                rank = 3
+            return rank, low
+
+        selected = sorted(candidates, key=score)[0]
+        self._model_cache["auto"] = (selected, now + 1800)
+        self.logger.info("Auto-selected Gemini model: %s", selected)
+        return selected
+
+    def _allowed_dialog(self, dialog_id: int, message: Any) -> bool:
+        private_only = bool(self.get_setting("private_only", True))
+        is_private = dialog_id > 0
+        if private_only:
+            return is_private
+        if not is_private and not bool(self.get_setting("reply_to_groups", False)):
+            return False
+        return True
+
+    def _schedule_allowed(self) -> bool:
+        if int(self.get_setting("schedule_mode", 0) or 0) == 0:
+            return True
+
+        now = dt.datetime.now()
+        start_date = str(self.get_setting("start_date", "") or "").strip()
+        end_date = str(self.get_setting("end_date", "") or "").strip()
+        try:
+            if start_date and now.date() < dt.date.fromisoformat(start_date):
+                return False
+            if end_date and now.date() > dt.date.fromisoformat(end_date):
+                return False
+        except ValueError:
+            return False
+
+        start = self._parse_time(str(self.get_setting("start_time", "00:00") or "00:00"))
+        end = self._parse_time(str(self.get_setting("end_time", "23:59") or "23:59"))
+        if start is None or end is None:
+            return False
+        current = now.time().replace(second=0, microsecond=0)
+        if start <= end:
+            return start <= current <= end
+        return current >= start or current <= end
+
+    def _remember(self, account: int, dialog_id: int, role: str, text: str):
+        key = (int(account), int(dialog_id))
+        with self._lock:
+            items = self._context.setdefault(key, [])
+            items.append((role, text.strip()))
+            if len(items) > 30:
+                del items[:-30]
+
+    def _get_context(
+        self, account: int, dialog_id: int, count: int
+    ) -> List[Tuple[str, str]]:
+        key = (int(account), int(dialog_id))
+        with self._lock:
+            return list(self._context.get(key, [])[-count:])
+
+    @staticmethod
+    def _dialog_id(message: Any) -> Optional[int]:
+        value = getattr(message, "dialog_id", None)
+        if value is not None:
+            try:
+                return int(value)
+            except Exception:
+                pass
+        peer = getattr(message, "peer_id", None)
+        if peer is None:
+            return None
+        for attr in ("user_id", "chat_id", "channel_id"):
+            value = getattr(peer, attr, None)
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except Exception:
+                continue
+            if attr == "chat_id":
+                return -number
+            if attr == "channel_id":
+                return -1000000000000 - number
+            return number
+        return None
+
+    def _still_latest(self, account: int, dialog_id: int, message_id: int) -> bool:
+        with self._lock:
+            return (int(account), int(dialog_id), int(message_id)) in self._seen
+
+    def _delay_seconds(self) -> float:
+        minimum = self._int_setting("delay_min", 2, 0, 300)
+        maximum = self._int_setting("delay_max", 5, minimum, 300)
+        if maximum <= minimum:
+            return float(minimum)
+        import random
+        return random.uniform(minimum, maximum)
+
+    def _int_setting(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(self.get_setting(key, default)).strip())
+        except Exception:
+            value = default
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _parse_time(value: str) -> Optional[dt.time]:
+        try:
+            hour, minute = value.strip().split(":", 1)
+            return dt.time(int(hour), int(minute))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_text(data: Dict[str, Any]) -> str:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        return "".join(
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("text")
+        )
+
+    @staticmethod
+    def _short_error(text: str) -> str:
+        try:
+            data = __import__("json").loads(text)
+            message = data.get("error", {}).get("message")
+            if message:
+                return str(message)[:300]
+        except Exception:
+            pass
+        return str(text).replace("\n", " ")[:300]
+
+    def _show_help(self):
+        def show():
+            from client_utils import get_last_fragment
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("AutoResp")
+            builder.set_message(
+                "1. включи автоответчик.\n"
+                "2. создай Gemini API key в Google AI Studio и вставь его в поле Gemini API key.\n"
+                "3. выбери качество или оставь «Рекомендуемый».\n"
+                "4. модель «auto» подбирается автоматически.\n"
+                "5. задай свой системный промпт.\n"
+                "6. установи задержку и, если нужно, расписание.\n\n"
+                "API-запросы идут напрямую с телефона в Gemini. "
+                "ключ не записывается в этот репозиторий."
+            )
+            builder.set_positive_button("Понятно", lambda b, _w: b.dismiss())
+            builder.show()
+        run_on_ui_thread(show)
+
+    def _test_api(self):
+        api_key = str(self.get_setting("api_key", "") or "").strip()
+        if not api_key:
+            BulletinHelper.show_error("Сначала укажи Gemini API key")
+            return
+        BulletinHelper.show_info("Проверяю Gemini API…")
+
+        def task():
+            try:
+                model = self._resolve_model(api_key)
+                if not model:
+                    raise RuntimeError("Подходящая модель не найдена")
+                response = requests.post(
+                    f"{GEMINI_BASE}/{model}:generateContent",
+                    headers={
+                        "x-goog-api-key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "contents": [
+                            {"role": "user", "parts": [{"text": "ответь одним словом: ok"}]}
+                        ],
+                        "generationConfig": {"maxOutputTokens": 8},
+                    },
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {self._short_error(response.text)}"
+                    )
+                text = self._extract_text(response.json()).strip()
+                if not text:
+                    raise RuntimeError("API не вернул текст")
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_success(f"Gemini работает • {model}")
+                )
+            except Exception as exc:
+                self.logger.exception("Gemini test failed")
+                message = str(exc)[:240]
+                run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+
+        run_on_queue(task, EXTERNAL_NETWORK_QUEUE)
