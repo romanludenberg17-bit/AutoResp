@@ -5,20 +5,12 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from android_utils import run_on_ui_thread
 from base_plugin import BasePlugin, HookResult
-from client_utils import (
-    EXTERNAL_NETWORK_QUEUE,
-    NotificationCenterDelegate,
-    get_last_fragment,
-    get_notification_center,
-    run_on_queue,
-    send_text,
-)
-from org.telegram.messenger import NotificationCenter
+from client_utils import EXTERNAL_NETWORK_QUEUE, get_last_fragment, run_on_queue, send_text
 from ui.alert import AlertDialogBuilder
 from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
 from android.content import Intent
@@ -26,43 +18,30 @@ from android.net import Uri
 
 __id__ = "autoresp"
 __name__ = "AutoResp — Gemini AI"
-__description__ = "Быстрый AI-автоответчик для Telegram через Gemini API: мгновенное обнаружение новых сообщений, параллельная обработка, контекст, расписание и диагностика."
+__description__ = "Быстрый AI-автоответчик для Telegram через Gemini API с контекстом, расписанием, задержкой и диагностикой."
 __author__ = "@h0nkey"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.4.3"
 
-GEMINI_BASES = (
-    "https://generativelanguage.googleapis.com/v1beta",
-    "https://generativelanguage.googleapis.com/v1",
-)
+GEMINI_BASES = ("https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1")
 AUTHOR_CHANNEL = "https://t.me/rommy_apps"
-DEFAULT_PROMPT = (
-    "ты — мой личный автоответчик в Telegram. отвечай естественно, коротко и по-человечески. "
-    "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
-    "не выдумывай факты обо мне. учитывай контекст предыдущих сообщений. "
-    "не отправляй рекламу, ссылки или массовые сообщения без явной причины."
-)
-QUALITY = {
-    0: {"tokens": 384, "temperature": 0.55},
-    1: {"tokens": 768, "temperature": 0.70},
-    2: {"tokens": 1536, "temperature": 0.80},
-}
-
-
-class _NewMessageDelegate(NotificationCenterDelegate):
-    """Fast client-side detector. Telegram fires this when new messages arrive."""
-
-    def __init__(self, plugin: "AutoRespPlugin"):
-        self.plugin = plugin
-
-    def didReceivedNotification(self, notification_id: int, account: int, args: Any):
-        if notification_id == NotificationCenter.didReceiveNewMessages:
-            self.plugin._on_new_messages_notification(account, args)
+DEFAULT_PROMPT = ("ты — мой личный автоответчик в Telegram. отвечай естественно, коротко и по-человечески. "
+                  "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
+                  "не выдумывай факты обо мне. учитывай контекст предыдущих сообщений. "
+                  "не отправляй рекламу, ссылки или массовые сообщения без явной причины.")
+QUALITY = {0: {"tokens": 384, "temperature": 0.55}, 1: {"tokens": 768, "temperature": 0.70}, 2: {"tokens": 1536, "temperature": 0.80}}
 
 
 class AutoRespPlugin(BasePlugin):
+    """Gemini auto-replier using exteraGram update hooks only.
+
+    NotificationCenterDelegate is intentionally not used: on some Chaquopy
+    builds a normal Python subclass of that Java proxy raises
+    `dynamic_proxy must be used first in class bases` during module import.
+    """
+
     def __init__(self):
         super().__init__()
         self._seen: set[Tuple[int, int, int]] = set()
@@ -70,51 +49,32 @@ class AutoRespPlugin(BasePlugin):
         self._context: Dict[Tuple[int, int], List[Tuple[str, str]]] = {}
         self._last_reply: Dict[Tuple[int, int], float] = {}
         self._model_cache: Dict[str, Tuple[str, str, float]] = {}
-        self._stats = {
-            "hooks": 0,
-            "notifications": 0,
-            "incoming": 0,
-            "queued": 0,
-            "sent": 0,
-            "errors": 0,
-            "last": "",
-        }
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="AutoResp")
-        self._notification_delegates: List[Tuple[int, _NewMessageDelegate, Any]] = []
         self._loaded = False
+        self._stats = {"hooks": 0, "incoming": 0, "queued": 0, "sent": 0, "errors": 0, "last": ""}
 
     def create_settings(self) -> List[Any]:
         return [
             Header(text="AutoResp — Gemini AI"),
-            Switch(
-                key="enabled",
-                text="Включить автоответчик",
-                subtext="Отвечает на новые входящие сообщения",
-                default=False,
-            ),
-            Switch(
-                key="fast_mode",
-                text="Максимальная скорость",
-                subtext="0 сек задержки + параллельная обработка ответов",
-                default=True,
-            ),
+            Switch(key="enabled", text="Включить автоответчик", subtext="Отвечает на новые входящие сообщения", default=False),
+            Switch(key="fast_mode", text="Максимальная скорость", subtext="Без искусственной задержки", default=True),
             Text(text="Проверить работу плагина", icon="msg_check", on_click=lambda _v: self._test_plugin()),
             Text(text="Проверить Gemini API", icon="msg_check", on_click=lambda _v: self._test_api()),
-            Text(text="Диагностика входящих", icon="msg_info", on_click=lambda _v: self._show_diagnostics()),
+            Text(text="Диагностика", icon="msg_info", on_click=lambda _v: self._show_diagnostics()),
             Text(text="Канал автора", icon="msg_channel", on_click=lambda _v: self._open_author_channel()),
             Text(text="? Как пользоваться", icon="msg_help", on_click=lambda _v: self._show_help()),
             Divider(text="Gemini"),
             Input(key="api_key", text="Gemini API key", default="", subtext="ключ хранится локально в настройках плагина"),
             Selector(key="quality", text="Режим качества", items=["Экономный", "Рекомендуемый", "Усиленный"], default=1),
-            Input(key="model", text="Модель", default="auto", subtext="auto — выбирается доступная Gemini-модель"),
+            Input(key="model", text="Модель", default="auto", subtext="auto — выбор доступной Gemini-модели"),
             EditText(key="prompt", hint="Системный промпт", default=DEFAULT_PROMPT, multiline=True, max_length=6000),
             Divider(text="Автоответчик"),
             Switch(key="private_only", text="Только личные сообщения", subtext="Без групп и каналов", default=True),
-            Switch(key="reply_to_groups", text="Отвечать в группах", subtext="Работает только при отключённом режиме «только личные сообщения»", default=False),
+            Switch(key="reply_to_groups", text="Отвечать в группах", subtext="Используется только если режим выше выключен", default=False),
             Input(key="delay_min", text="Минимальная задержка, сек", default="0"),
             Input(key="delay_max", text="Максимальная задержка, сек", default="0"),
-            Input(key="cooldown", text="Пауза между автоответами, сек", default="0", subtext="0 — отвечать на каждое входящее сообщение"),
+            Input(key="cooldown", text="Пауза между автоответами, сек", default="0", subtext="0 — без паузы"),
             Input(key="context_count", text="Сообщений контекста", default="8"),
             Divider(text="Расписание"),
             Selector(key="schedule_mode", text="Когда отвечать", items=["Всегда", "По расписанию"], default=0),
@@ -123,466 +83,253 @@ class AutoRespPlugin(BasePlugin):
             Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
             Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
             Divider(),
-            Text(text="AutoResp 1.1.0 • Gemini REST", subtext="Слушает событие новых сообщений Telegram и обрабатывает ответы параллельно"),
+            Text(text="AutoResp 1.1.1 • Gemini REST", subtext="Стабильный режим: только SDK update hooks, без Java NotificationCenter proxy"),
         ]
 
     def on_plugin_load(self):
         self._loaded = True
-        for name in (
-            "TL_updateNewMessage",
-            "TL_updateNewChannelMessage",
-            "TL_updateShortMessage",
-            "TL_updateShortChatMessage",
-        ):
-            self.add_hook(name)
-
-        # NotificationCenter is the fastest app-level signal for a newly received message.
-        # Register all normal exteraGram account slots so background accounts are covered too.
-        for account in range(4):
+        for name in ("TL_updateNewMessage", "TL_updateNewChannelMessage", "TL_updateShortMessage", "TL_updateShortChatMessage"):
             try:
-                delegate = _NewMessageDelegate(self)
-                center = get_notification_center(account)
-                center.addObserver(delegate, NotificationCenter.didReceiveNewMessages)
-                self._notification_delegates.append((account, delegate, center))
+                self.add_hook(name)
             except Exception:
-                self.logger.exception("Failed to register NotificationCenter observer for account %s", account)
-
-        self.logger.info("AutoResp 1.1.0 loaded: fast message detector enabled")
+                self.logger.exception("Failed to add hook %s", name)
+        self.logger.info("AutoResp 1.1.1 loaded")
 
     def on_plugin_unload(self):
         self._loaded = False
-        for account, delegate, center in list(self._notification_delegates):
-            try:
-                center.removeObserver(delegate, NotificationCenter.didReceiveNewMessages)
-            except Exception:
-                self.logger.exception("Failed to remove NotificationCenter observer for account %s", account)
-        self._notification_delegates.clear()
         with self._lock:
-            self._seen.clear()
-            self._pending.clear()
-            self._context.clear()
-            self._last_reply.clear()
-            self._model_cache.clear()
+            self._seen.clear(); self._pending.clear(); self._context.clear(); self._last_reply.clear(); self._model_cache.clear()
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        self.logger.info("AutoResp unloaded")
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        with self._lock:
+            self._stats["hooks"] += 1; self._stats["last"] = update_name
+        if not self._loaded or not self.get_setting("enabled", False):
+            return HookResult()
+        if update_name not in ("TL_updateNewMessage", "TL_updateNewChannelMessage", "TL_updateShortMessage", "TL_updateShortChatMessage"):
+            return HookResult()
+        try:
+            _message, dialog_id, message_id, text, outgoing, is_group = self._extract_update(update_name, update)
+            if not text or dialog_id is None or message_id is None or outgoing:
+                return HookResult()
+            if update_name == "TL_updateNewChannelMessage":
+                is_group = True
+            if is_group and bool(self.get_setting("private_only", True)):
+                return HookResult()
+            if is_group and not bool(self.get_setting("reply_to_groups", False)):
+                return HookResult()
+            self._accept_message(account, dialog_id, message_id, text, is_group)
+        except Exception:
+            with self._lock: self._stats["errors"] += 1
+            self.logger.exception("AutoResp update processing failed")
+        return HookResult()
+
+    def _extract_update(self, update_name: str, update: Any):
+        message = getattr(update, "message", None) or update
+        message_id = self._int_attr(message, "id", self._int_attr(update, "id", 0))
+        text = self._text_from(message)
+        outgoing = bool(getattr(message, "out", getattr(update, "out", False)))
+        dialog_id = None; is_group = False
+        if update_name == "TL_updateShortMessage":
+            dialog_id = self._int_attr(update, "user_id", 0); text = self._text_from(update); outgoing = bool(getattr(update, "out", False))
+        elif update_name == "TL_updateShortChatMessage":
+            chat_id = self._int_attr(update, "chat_id", 0); dialog_id = -chat_id if chat_id else None; is_group = True
+            text = self._text_from(update); outgoing = bool(getattr(update, "out", False))
+        else:
+            for attr in ("dialog_id", "dialogId"):
+                value = getattr(message, attr, None)
+                if value is not None:
+                    try: dialog_id = int(value); break
+                    except Exception: pass
+            if dialog_id is None:
+                getter = getattr(message, "getDialogId", None)
+                if callable(getter):
+                    try: dialog_id = int(getter())
+                    except Exception: pass
+            if dialog_id is None:
+                peer_id = getattr(message, "peer_id", None); from_id = getattr(message, "from_id", None)
+                if peer_id is not None: dialog_id = self._peer_id(peer_id)
+                elif from_id is not None: dialog_id = self._peer_id(from_id)
+            is_group = bool(dialog_id is not None and dialog_id < 0)
+        return message, dialog_id, message_id, text, outgoing, is_group
+
+    def _peer_id(self, obj: Any) -> Optional[int]:
+        try:
+            if hasattr(obj, "user_id"): return int(getattr(obj, "user_id"))
+            if hasattr(obj, "chat_id"): return -int(getattr(obj, "chat_id"))
+            if hasattr(obj, "channel_id"): return -int(getattr(obj, "channel_id"))
+            return int(obj)
+        except Exception: return None
+
+    def _text_from(self, obj: Any) -> str:
+        for attr in ("message", "text"):
+            value = getattr(obj, attr, None)
+            if isinstance(value, str): return value.strip()
+        return ""
+
+    def _int_attr(self, obj: Any, name: str, default: int = 0) -> int:
+        try: return int(getattr(obj, name, default) or default)
+        except Exception: return default
+
+    def _accept_message(self, account: int, dialog_id: int, message_id: int, text: str, is_group: bool):
+        key = (account, int(dialog_id), int(message_id)); now = time.time()
+        with self._lock:
+            if key in self._seen or key in self._pending: return
+            self._seen.add(key)
+            if len(self._seen) > 5000: self._seen = set(list(self._seen)[-2500:])
+            self._stats["incoming"] += 1
+        if not self._schedule_allows(now): return
+        cooldown = self._number_setting("cooldown", 0.0, 0.0, 86400.0); last_key = (account, int(dialog_id))
+        with self._lock:
+            if cooldown and now - self._last_reply.get(last_key, 0.0) < cooldown: return
+            self._pending.add(key); self._stats["queued"] += 1
+        delay = 0.0 if bool(self.get_setting("fast_mode", True)) else self._delay_seconds()
+        task = lambda: self._worker(account, dialog_id, text, key, is_group)
+        if delay > 0: run_on_queue(task, EXTERNAL_NETWORK_QUEUE, int(delay * 1000))
+        else: self._executor.submit(task)
+
+    def _worker(self, account: int, dialog_id: int, text: str, key: Tuple[int, int, int], is_group: bool):
+        try:
+            api_key = str(self.get_setting("api_key", "") or "").strip()
+            if not api_key: return
+            answer = self._generate(api_key, text, self._get_context(account, dialog_id), is_group).strip()
+            if not answer: return
+            answer = answer[:4096]; send_text(dialog_id, answer, account=account)
+            with self._lock:
+                self._last_reply[(account, dialog_id)] = time.time(); self._stats["sent"] += 1
+                ctx = self._context.setdefault((account, dialog_id), []); ctx.extend((("user", text), ("assistant", answer)))
+                limit = max(2, int(self._number_setting("context_count", 8, 2, 30))); self._context[(account, dialog_id)] = ctx[-limit:]
+        except Exception:
+            with self._lock: self._stats["errors"] += 1
+            self.logger.exception("AutoResp worker failed")
+        finally:
+            with self._lock: self._pending.discard(key)
+
+    def _get_context(self, account: int, dialog_id: int):
+        with self._lock: return list(self._context.get((account, dialog_id), []))
+
+    def _generate(self, api_key: str, text: str, context: List[Tuple[str, str]], is_group: bool) -> str:
+        model, base = self._resolve_model(api_key); q = QUALITY.get(int(self.get_setting("quality", 1) or 1), QUALITY[1])
+        prompt = str(self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT).strip()
+        history = "\n".join(f"{role}: {item}" for role, item in context[-20:]); user_text = (f"контекст:\n{history}\n\n" if history else "") + f"новое сообщение: {text}"
+        if is_group: user_text += "\nэто групповая переписка; отвечай только на само сообщение, без массового обращения."
+        payload = {"systemInstruction": {"parts": [{"text": prompt}]}, "contents": [{"role": "user", "parts": [{"text": user_text}]}], "generationConfig": {"temperature": q["temperature"], "maxOutputTokens": q["tokens"]}}
+        r = self._gemini_post(base, model, api_key, payload)
+        if r is None or r.status_code != 200: raise RuntimeError(f"Gemini HTTP {getattr(r, 'status_code', 'нет ответа')}: {self._short_error(getattr(r, 'text', ''))}")
+        return self._extract_text(r.json())
+
+    def _resolve_model(self, api_key: str):
+        manual = str(self.get_setting("model", "auto") or "auto").strip()
+        if manual and manual.lower() != "auto": return manual.replace("models/", ""), GEMINI_BASES[0]
+        cached = self._model_cache.get(api_key)
+        if cached and time.time() - cached[2] < 1800: return cached[0], cached[1]
+        last_error = ""
+        for base in GEMINI_BASES:
+            try:
+                r = requests.get(base + "/models", params={"key": api_key}, timeout=12)
+                if r.status_code != 200: last_error = f"HTTP {r.status_code}: {self._short_error(r.text)}"; continue
+                candidates = []
+                for item in r.json().get("models", []):
+                    name = str(item.get("name", "")).replace("models/", ""); methods = item.get("supportedGenerationMethods", [])
+                    if not name or "generateContent" not in methods: continue
+                    low = name.lower()
+                    if any(x in low for x in ("embedding", "image", "tts", "live", "audio", "robotics")): continue
+                    candidates.append((0 if "flash-lite" in low else 1 if "flash" in low else 2 if "pro" in low else 3, name))
+                if candidates:
+                    model = sorted(candidates)[0][1]; self._model_cache[api_key] = (model, base, time.time()); return model, base
+                last_error = "нет доступной модели с generateContent"
+            except Exception as exc: last_error = str(exc)
+        raise RuntimeError("не удалось определить Gemini-модель: " + last_error)
+
+    def _gemini_post(self, base: str, model: str, api_key: str, payload: dict):
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.post(f"{base}/models/{model}:generateContent", params={"key": api_key}, json=payload, timeout=45)
+                if response.status_code == 404 and base == GEMINI_BASES[0]:
+                    response = requests.post(f"{GEMINI_BASES[1]}/models/{model}:generateContent", params={"key": api_key}, json=payload, timeout=45)
+                if response.status_code not in (408, 429, 500, 502, 503, 504): return response
+                time.sleep(0.7 * (2 ** attempt))
+            except requests.RequestException:
+                if attempt == 2: raise
+                time.sleep(0.7 * (2 ** attempt))
+        return response
+
+    def _extract_text(self, data: dict) -> str:
+        parts = []
+        for candidate in data.get("candidates", []) or []:
+            for part in (candidate.get("content", {}) or {}).get("parts", []) or []:
+                if part.get("text"): parts.append(str(part["text"]))
+        return "\n".join(parts).strip()
+
+    def _schedule_allows(self, timestamp: float) -> bool:
+        if int(self.get_setting("schedule_mode", 0) or 0) == 0: return True
+        now = dt.datetime.fromtimestamp(timestamp); start_date = str(self.get_setting("start_date", "") or "").strip(); end_date = str(self.get_setting("end_date", "") or "").strip()
+        try:
+            if start_date and now.date() < dt.date.fromisoformat(start_date): return False
+            if end_date and now.date() > dt.date.fromisoformat(end_date): return False
+        except ValueError: return False
+        def hm(value, default):
+            try:
+                s = str(value or default).strip(); return dt.time.fromisoformat(s + ":00" if len(s) == 5 else s)
+            except ValueError: return dt.time.fromisoformat(default)
+        start = hm(self.get_setting("start_time", "00:00"), "00:00"); end = hm(self.get_setting("end_time", "23:59"), "23:59")
+        return start <= now.time() <= end if start <= end else now.time() >= start or now.time() <= end
+
+    def _delay_seconds(self) -> float:
+        low = self._number_setting("delay_min", 0.0, 0.0, 3600.0); high = self._number_setting("delay_max", low, low, 3600.0); return random.uniform(low, high)
+
+    def _number_setting(self, key: str, default: float, minimum: float = 0.0, maximum: float = 3600.0) -> float:
+        try: return max(minimum, min(maximum, float(str(self.get_setting(key, default)).replace(",", "."))))
+        except Exception: return default
+
+    def _short_error(self, text: str) -> str: return " ".join(str(text or "").split())[:500]
+
+    def _test_plugin(self):
+        key = str(self.get_setting("api_key", "") or "").strip()
+        if not key: return self._dialog("Проверка AutoResp", "сначала укажи Gemini API key.")
+        self._executor.submit(self._test_worker, key)
+
+    def _test_worker(self, key: str):
+        try:
+            model, base = self._resolve_model(key); q = QUALITY.get(int(self.get_setting("quality", 1) or 1), QUALITY[1])
+            payload = {"systemInstruction": {"parts": [{"text": "ответь коротко: тест AutoResp пройден."}]}, "contents": [{"role": "user", "parts": [{"text": "проверка работы автоответчика"}]}], "generationConfig": {"temperature": q["temperature"], "maxOutputTokens": q["tokens"]}}
+            r = self._gemini_post(base, model, key, payload)
+            if r is None or r.status_code != 200: raise RuntimeError(f"Gemini HTTP {getattr(r, 'status_code', 'нет ответа')}: {self._short_error(getattr(r, 'text', ''))}")
+            self._dialog("Проверка AutoResp", f"работает.\n\nмодель: {model}\nAPI: OK\nответ:\n{self._extract_text(r.json())}")
+        except Exception as exc: self._dialog("Проверка AutoResp", f"ошибка:\n{exc}")
+
+    def _test_api(self):
+        key = str(self.get_setting("api_key", "") or "").strip()
+        if not key: return self._dialog("Gemini API", "Gemini API key не указан.")
+        self._executor.submit(self._api_worker, key)
+
+    def _api_worker(self, key: str):
+        try:
+            model, base = self._resolve_model(key); self._dialog("Gemini API", f"Gemini работает.\n\nмодель: {model}\nendpoint: {base}")
+        except Exception as exc: self._dialog("Gemini API", f"ошибка:\n{exc}")
+
+    def _show_diagnostics(self):
+        with self._lock: s = dict(self._stats); pending = len(self._pending)
+        self._dialog("Диагностика AutoResp", f"hook-событий: {s['hooks']}\nвходящих: {s['incoming']}\nпоставлено: {s['queued']}\nотправлено: {s['sent']}\nошибок: {s['errors']}\nожидают: {pending}\nпоследнее событие: {s['last'] or 'нет'}")
+
+    def _show_help(self):
+        self._dialog("Как пользоваться AutoResp", "1. укажи Gemini API key.\n2. нажми «Проверить работу плагина».\n3. включи автоответчик.\n4. напиши на этот аккаунт с другого аккаунта.\n\nВ 1.1.1 убран NotificationCenterDelegate, вызывавший ошибку Chaquopy «dynamic_proxy must be used first in class bases». Используются только штатные SDK update hooks.")
 
     def _open_author_channel(self):
         try:
-            fragment = get_last_fragment()
-            activity = fragment.getParentActivity() if fragment else None
-            if activity:
-                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(AUTHOR_CHANNEL)))
-        except Exception:
-            self.logger.exception("Failed to open author channel")
+            fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
+            if activity: activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(AUTHOR_CHANNEL)))
+        except Exception: self.logger.exception("Failed to open author channel")
 
     def _dialog(self, title: str, message: str):
         def show():
             try:
-                fragment = get_last_fragment()
-                activity = fragment.getParentActivity() if fragment else None
-                if not activity:
-                    return
-                builder = AlertDialogBuilder(activity)
-                builder.set_title(title)
-                builder.set_message(message)
-                builder.set_positive_button("ок", lambda b, w: b.dismiss())
-                builder.show()
-            except Exception:
-                self.logger.exception("Failed to show dialog")
+                fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
+                if not activity: return
+                builder = AlertDialogBuilder(activity); builder.set_title(title); builder.set_message(message); builder.set_positive_button("ок", lambda b, w: b.dismiss()); builder.show()
+            except Exception: self.logger.exception("Failed to show dialog")
         run_on_ui_thread(show)
-
-    def _test_plugin(self):
-        api_key = str(self.get_setting("api_key", "") or "").strip()
-        if not api_key:
-            return self._dialog("Проверка AutoResp", "сначала укажи Gemini API key.")
-        self._executor.submit(self._test_plugin_worker, api_key)
-
-    def _test_plugin_worker(self, api_key: str):
-        try:
-            model, base = self._resolve_model(api_key)
-            q = QUALITY.get(int(self.get_setting("quality", 1) or 1), QUALITY[1])
-            payload = {
-                "systemInstruction": {"parts": [{"text": "ответь коротко: тест AutoResp пройден."}]},
-                "contents": [{"role": "user", "parts": [{"text": "проверка работы автоответчика"}]}],
-                "generationConfig": {"temperature": q["temperature"], "maxOutputTokens": q["tokens"]},
-            }
-            response = self._gemini_post(base, model, api_key, payload)
-            if response is None or response.status_code != 200:
-                raise RuntimeError(f"Gemini HTTP {getattr(response, 'status_code', 'нет ответа')}: {self._short_error(getattr(response, 'text', ''))}")
-            answer = self._extract_text(response.json()).strip() or "Gemini вернул пустой ответ"
-            self._dialog("Проверка AutoResp", f"работает.\n\nмодель: {model}\nAPI: OK\nответ Gemini:\n{answer}")
-        except Exception as exc:
-            self.logger.exception("AutoResp test failed")
-            self._dialog("Проверка AutoResp", f"ошибка проверки:\n{exc}")
-
-    def _test_api(self):
-        api_key = str(self.get_setting("api_key", "") or "").strip()
-        if not api_key:
-            return self._dialog("Gemini API", "Gemini API key не указан.")
-        self._executor.submit(self._test_api_worker, api_key)
-
-    def _test_api_worker(self, api_key: str):
-        try:
-            model, base = self._resolve_model(api_key)
-            self._dialog("Gemini API", f"Gemini работает.\n\nмодель: {model}\nendpoint: {base}")
-        except Exception as exc:
-            self.logger.exception("Gemini API test failed")
-            self._dialog("Gemini API", f"ошибка:\n{exc}")
-
-    def _show_diagnostics(self):
-        with self._lock:
-            stats = dict(self._stats)
-            pending = len(self._pending)
-            observers = len(self._notification_delegates)
-        self._dialog(
-            "Диагностика AutoResp",
-            f"hook-событий: {stats['hooks']}\n"
-            f"NotificationCenter: {stats['notifications']}\n"
-            f"входящих принято: {stats['incoming']}\n"
-            f"поставлено в обработку: {stats['queued']}\n"
-            f"ответов отправлено: {stats['sent']}\n"
-            f"ошибок: {stats['errors']}\n"
-            f"ожидают обработки: {pending}\n"
-            f"наблюдателей: {observers}\n"
-            f"последнее событие: {stats['last'] or 'нет'}",
-        )
-
-    def _show_help(self):
-        self._dialog(
-            "Как пользоваться AutoResp",
-            "1. укажи Gemini API key.\n"
-            "2. нажми «Проверить работу плагина».\n"
-            "3. включи автоответчик.\n"
-            "4. напиши на этот Telegram-аккаунт с другого аккаунта.\n"
-            "5. AutoResp обнаружит сообщение через NotificationCenter и сразу запустит Gemini.\n\n"
-            "режим «Максимальная скорость» работает без искусственной задержки. несколько сообщений могут обрабатываться параллельно.\n\n"
-            "плагин не читает Android-шторку буквально: он слушает внутреннее событие Telegram о новых сообщениях. поэтому сообщение может быть обнаружено, даже когда открыт другой экран Telegram или приложение находится в фоне, пока процесс exteraGram жив и получает обновления.\n\n"
-            "исходящие сообщения самого аккаунта игнорируются. cooldown = 0 отвечает на каждое принятое сообщение.\n\n"
-            "канал автора: @rommy_apps",
-        )
-
-    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
-        with self._lock:
-            self._stats["hooks"] += 1
-            self._stats["last"] = update_name
-        if update_name not in (
-            "TL_updateNewMessage",
-            "TL_updateNewChannelMessage",
-            "TL_updateShortMessage",
-            "TL_updateShortChatMessage",
-        ):
-            return HookResult()
-        if not self.get_setting("enabled", False):
-            return HookResult()
-        message, dialog_id = self._extract_update(update_name, update)
-        if message is None or dialog_id is None:
-            return HookResult()
-        self._accept_message(account, message, dialog_id, "hook")
-        return HookResult()
-
-    def _on_new_messages_notification(self, account: int, args: Any):
-        if not self._loaded or not self.get_setting("enabled", False):
-            return
-        try:
-            if args is None or len(args) < 2:
-                return
-            scheduled = bool(args[2]) if len(args) > 2 else False
-            if scheduled:
-                return
-            fallback_dialog = int(args[0] or 0)
-            messages = args[1]
-            with self._lock:
-                self._stats["notifications"] += 1
-                self._stats["last"] = "NotificationCenter.didReceiveNewMessages"
-            for message_object in messages or []:
-                message = getattr(message_object, "messageOwner", None) or getattr(message_object, "message", None) or message_object
-                dialog_id = fallback_dialog
-                try:
-                    get_dialog_id = getattr(message_object, "getDialogId", None)
-                    if get_dialog_id:
-                        candidate = int(get_dialog_id())
-                        if candidate:
-                            dialog_id = candidate
-                except Exception:
-                    pass
-                self._accept_message(account, message, dialog_id, "notification")
-        except Exception:
-            self.logger.exception("NotificationCenter new-message handler failed")
-
-    def _accept_message(self, account: int, message: Any, dialog_id: int, source: str):
-        try:
-            text = getattr(message, "message", None)
-            if not isinstance(text, str) or not text.strip():
-                return
-            if bool(getattr(message, "out", False)):
-                return
-            message_id = int(getattr(message, "id", 0) or 0)
-            if message_id == 0:
-                return
-            if not self._allowed_dialog(dialog_id) or not self._schedule_allowed():
-                return
-
-            key = (int(account), int(dialog_id))
-            seen_key = (int(account), int(dialog_id), message_id)
-            with self._lock:
-                if seen_key in self._seen:
-                    return
-                self._seen.add(seen_key)
-                if len(self._seen) > 8000:
-                    self._seen = set(list(self._seen)[-4000:])
-                cooldown = self._int_setting("cooldown", 0, 0, 86400)
-                now = time.time()
-                if cooldown and now - self._last_reply.get(key, 0.0) < cooldown:
-                    return
-                self._pending.add(seen_key)
-                self._stats["incoming"] += 1
-                self._stats["queued"] += 1
-
-            clean_text = text.strip()
-            self._remember(account, dialog_id, "user", clean_text)
-            delay_ms = int(self._delay_seconds() * 1000)
-            task = lambda: self._generate_and_reply(account, dialog_id, clean_text, message_id, seen_key)
-            # Do not serialize Gemini calls behind EXTERNAL_NETWORK_QUEUE.
-            # A small delay still uses the SDK queue; zero-delay goes straight to a worker.
-            if delay_ms > 0:
-                run_on_queue(task, EXTERNAL_NETWORK_QUEUE, delay_ms)
-            else:
-                self._executor.submit(task)
-        except Exception:
-            with self._lock:
-                self._stats["errors"] += 1
-            self.logger.exception("Failed to accept incoming message from %s", source)
-
-    def _extract_update(self, update_name: str, update: Any):
-        if update_name in ("TL_updateShortMessage", "TL_updateShortChatMessage"):
-            user_id = int(getattr(update, "user_id", 0) or 0)
-            chat_id = int(getattr(update, "chat_id", 0) or 0)
-            if update_name == "TL_updateShortMessage" and user_id:
-                return update, user_id
-            if update_name == "TL_updateShortChatMessage" and chat_id:
-                return update, -chat_id
-            return None, None
-        message = getattr(update, "message", None)
-        return message, self._dialog_id(message) if message is not None else None
-
-    def _generate_and_reply(self, account: int, dialog_id: int, incoming: str, message_id: int, seen_key):
-        key = (int(account), int(dialog_id))
-        try:
-            api_key = str(self.get_setting("api_key", "") or "").strip()
-            if not api_key:
-                raise RuntimeError("Gemini API key не указан")
-            model, base = self._resolve_model(api_key)
-            q = QUALITY.get(int(self.get_setting("quality", 1) or 1), QUALITY[1])
-            count = self._int_setting("context_count", 8, 1, 20)
-            with self._lock:
-                history = list(self._context.get(key, [])[-count:])
-            history_text = "\n".join(
-                f"{'пользователь' if role == 'user' else 'я'}: {text}" for role, text in history
-            )
-            system_prompt = str(self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT).strip()
-            payload = {
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "text": "контекст:\n"
-                                + (history_text or "(нет контекста)")
-                                + "\n\nпоследнее сообщение:\n"
-                                + incoming
-                            }
-                        ],
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": q["temperature"],
-                    "maxOutputTokens": q["tokens"],
-                },
-            }
-            response = self._gemini_post(base, model, api_key, payload)
-            if response is None or response.status_code != 200:
-                raise RuntimeError(
-                    f"Gemini HTTP {getattr(response, 'status_code', 'нет ответа')}: "
-                    f"{self._short_error(getattr(response, 'text', ''))}"
-                )
-            answer = self._extract_text(response.json()).strip()
-            if not answer:
-                raise RuntimeError("Gemini вернул пустой ответ")
-            send_text(dialog_id, answer[:4096], account=account)
-            self._remember(account, dialog_id, "assistant", answer[:4096])
-            with self._lock:
-                self._last_reply[key] = time.time()
-                self._stats["sent"] += 1
-        except Exception as exc:
-            with self._lock:
-                self._stats["errors"] += 1
-            self.logger.exception("AutoResp generation failed: %s", exc)
-        finally:
-            with self._lock:
-                self._pending.discard(seen_key)
-
-    def _resolve_model(self, api_key: str) -> Tuple[str, str]:
-        manual = str(self.get_setting("model", "auto") or "auto").strip()
-        if manual.lower() != "auto":
-            return manual.replace("models/", ""), GEMINI_BASES[0]
-        with self._lock:
-            cached = self._model_cache.get("auto")
-        if cached and cached[2] > time.time():
-            return cached[0], cached[1]
-
-        last_error = ""
-        for base in GEMINI_BASES:
-            try:
-                response = requests.get(
-                    f"{base}/models",
-                    headers={"x-goog-api-key": api_key, "Accept": "application/json"},
-                    timeout=12,
-                )
-                if response.status_code != 200:
-                    last_error = f"HTTP {response.status_code}: {self._short_error(response.text)}"
-                    continue
-                candidates = []
-                for item in response.json().get("models", []) or []:
-                    name = str(item.get("name", "")).replace("models/", "").strip()
-                    methods = item.get("supportedGenerationMethods", []) or []
-                    low = name.lower()
-                    if (
-                        name
-                        and "generateContent" in methods
-                        and "gemini" in low
-                        and not any(x in low for x in ("embedding", "image", "tts", "live", "audio", "robotics"))
-                    ):
-                        candidates.append(name)
-                if not candidates:
-                    last_error = "нет Gemini-модели с generateContent"
-                    continue
-
-                def score(name: str):
-                    low = name.lower()
-                    return (
-                        0 if "flash-lite" in low else 1 if "flash" in low else 2 if "pro" in low else 3,
-                        1 if any(x in low for x in ("preview", "exp")) else 0,
-                        low,
-                    )
-
-                selected = sorted(set(candidates), key=score)[0]
-                with self._lock:
-                    self._model_cache["auto"] = (selected, base, time.time() + 1800)
-                return selected, base
-            except Exception as exc:
-                last_error = str(exc)
-        raise RuntimeError(f"не удалось получить список моделей Gemini: {last_error[:240]}")
-
-    @staticmethod
-    def _gemini_post(base: str, model: str, api_key: str, payload: Dict[str, Any]):
-        headers = {
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "exteraGram-AutoResp/1.1.0",
-        }
-        last = None
-        for attempt in range(3):
-            try:
-                response = requests.post(
-                    f"{base}/models/{model}:generateContent",
-                    headers=headers,
-                    json=payload,
-                    timeout=45,
-                )
-                if response.status_code == 404 and base == GEMINI_BASES[0]:
-                    fallback = requests.post(
-                        f"{GEMINI_BASES[1]}/models/{model}:generateContent",
-                        headers=headers,
-                        json=payload,
-                        timeout=45,
-                    )
-                    response = fallback if fallback.status_code != 404 else response
-                if response.status_code not in (408, 429, 500, 502, 503, 504):
-                    return response
-                last = response
-                if attempt < 2:
-                    time.sleep(0.7 * (attempt + 1))
-            except requests.RequestException:
-                if attempt == 2:
-                    raise
-                time.sleep(0.7 * (attempt + 1))
-        return last
-
-    @staticmethod
-    def _extract_text(data: Dict[str, Any]) -> str:
-        parts = []
-        for candidate in data.get("candidates", []) or []:
-            for part in (candidate.get("content", {}) or {}).get("parts", []) or []:
-                if isinstance(part.get("text"), str):
-                    parts.append(part["text"])
-        return "\n".join(parts)
-
-    @staticmethod
-    def _short_error(text: str) -> str:
-        return " ".join(str(text or "").split())[:400]
-
-    def _dialog_id(self, message: Any):
-        peer = getattr(message, "peer_id", None)
-        if peer is None:
-            return None
-        user_id = int(getattr(peer, "user_id", 0) or 0)
-        if user_id:
-            return user_id
-        chat_id = int(getattr(peer, "chat_id", 0) or 0)
-        if chat_id:
-            return -chat_id
-        channel_id = int(getattr(peer, "channel_id", 0) or 0)
-        if channel_id:
-            return -1000000000000 - channel_id
-        return None
-
-    def _allowed_dialog(self, dialog_id: int) -> bool:
-        if bool(self.get_setting("private_only", True)):
-            return dialog_id > 0
-        if dialog_id > 0:
-            return True
-        return bool(self.get_setting("reply_to_groups", False)) and dialog_id < 0
-
-    def _schedule_allowed(self) -> bool:
-        if int(self.get_setting("schedule_mode", 0) or 0) == 0:
-            return True
-        now = dt.datetime.now()
-        try:
-            start_date = str(self.get_setting("start_date", "") or "").strip()
-            end_date = str(self.get_setting("end_date", "") or "").strip()
-            if start_date and now.date() < dt.date.fromisoformat(start_date):
-                return False
-            if end_date and now.date() > dt.date.fromisoformat(end_date):
-                return False
-            start = dt.time.fromisoformat(str(self.get_setting("start_time", "00:00") or "00:00"))
-            end = dt.time.fromisoformat(str(self.get_setting("end_time", "23:59") or "23:59"))
-            return start <= now.time() <= end if start <= end else now.time() >= start or now.time() <= end
-        except Exception:
-            return False
-
-    def _delay_seconds(self) -> float:
-        if bool(self.get_setting("fast_mode", True)):
-            return 0.0
-        minimum = max(0, self._int_setting("delay_min", 0, 0, 3600))
-        maximum = max(minimum, self._int_setting("delay_max", 0, minimum, 3600))
-        return random.uniform(minimum, maximum)
-
-    def _int_setting(self, key: str, default: int, low: int, high: int) -> int:
-        try:
-            value = int(str(self.get_setting(key, default) or default).strip())
-        except Exception:
-            value = default
-        return max(low, min(high, value))
-
-    def _remember(self, account: int, dialog_id: int, role: str, text: str):
-        key = (int(account), int(dialog_id))
-        with self._lock:
-            items = self._context.setdefault(key, [])
-            items.append((role, str(text)[:2000]))
-            if len(items) > 30:
-                del items[:-30]
