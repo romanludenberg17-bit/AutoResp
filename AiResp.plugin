@@ -20,8 +20,8 @@ from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
 __id__ = "autoresp"
 __name__ = "AutoResp"
 __description__ = "AI-автоответчик для Telegram через Gemini API."
-__author__ = "romanludenberg17-bit"
-__version__ = "1.0.1"
+__author__ = "@h0nkey"
+__version__ = "1.0.2"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.0"
@@ -137,7 +137,7 @@ class AutoRespPlugin(BasePlugin):
             Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
             Divider(),
             Text(
-                text="AutoResp 1.0.1 • Gemini REST • без собственного сервера",
+                text="AutoResp 1.0.2 • Gemini REST • без собственного сервера",
                 subtext="API-запросы выполняются прямо с телефона",
             ),
         ]
@@ -385,9 +385,7 @@ class AutoRespPlugin(BasePlugin):
             if len(items) > 30:
                 del items[:-30]
 
-    def _get_context(
-        self, account: int, dialog_id: int, count: int
-    ) -> List[Tuple[str, str]]:
+    def _get_context(self, account: int, dialog_id: int, count: int) -> List[Tuple[str, str]]:
         key = (int(account), int(dialog_id))
         with self._lock:
             return list(self._context.get(key, [])[-count:])
@@ -492,7 +490,6 @@ class AutoRespPlugin(BasePlugin):
             )
             builder.set_positive_button("Понятно", lambda b, _w: b.dismiss())
             builder.show()
-
         run_on_ui_thread(show)
 
     def _test_api(self):
@@ -500,7 +497,6 @@ class AutoRespPlugin(BasePlugin):
         if not api_key:
             BulletinHelper.show_error("Сначала укажи Gemini API key")
             return
-
         BulletinHelper.show_info("Проверяю Gemini API…")
 
         def task():
@@ -516,10 +512,7 @@ class AutoRespPlugin(BasePlugin):
                     },
                     json={
                         "contents": [
-                            {
-                                "role": "user",
-                                "parts": [{"text": "ответь одним словом: ok"}],
-                            }
+                            {"role": "user", "parts": [{"text": "ответь одним словом: ok"}]}
                         ],
                         "generationConfig": {"maxOutputTokens": 8},
                     },
