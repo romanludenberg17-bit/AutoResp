@@ -1,13 +1,10 @@
 from __future__ import annotations
-
 import datetime as dt
 import random
 import threading
 import time
 from typing import Any, Dict, List, Tuple
-
 import requests
-
 from android_utils import run_on_ui_thread
 from base_plugin import BasePlugin, HookResult
 from client_utils import EXTERNAL_NETWORK_QUEUE, run_on_queue, send_text, get_last_fragment
@@ -25,17 +22,12 @@ __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.4.3"
 
-GEMINI_BASES = (
-    "https://generativelanguage.googleapis.com/v1beta",
-    "https://generativelanguage.googleapis.com/v1",
-)
+GEMINI_BASES = ("https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1")
 AUTHOR_CHANNEL = "https://t.me/rommy_apps"
-DEFAULT_PROMPT = (
-    "ты — мой личный автоответчик в Telegram. отвечай естественно, коротко и по-человечески. "
-    "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
-    "не выдумывай факты обо мне. учитывай контекст предыдущих сообщений. "
-    "не отправляй рекламу, ссылки или массовые сообщения без явной причины."
-)
+DEFAULT_PROMPT = ("ты — мой личный автоответчик в Telegram. отвечай естественно, коротко и по-человечески. "
+                  "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
+                  "не выдумывай факты обо мне. учитывай контекст предыдущих сообщений. "
+                  "не отправляй рекламу, ссылки или массовые сообщения без явной причины.")
 QUALITY = {0: {"tokens": 384, "temperature": 0.55}, 1: {"tokens": 768, "temperature": 0.70}, 2: {"tokens": 1536, "temperature": 0.80}}
 
 class AutoRespPlugin(BasePlugin):
@@ -50,35 +42,33 @@ class AutoRespPlugin(BasePlugin):
         self._lock = threading.RLock()
 
     def create_settings(self) -> List[Any]:
-        return [
-            Header(text="AutoResp — Gemini AI"),
-            Switch(key="enabled", text="Включить автоответчик", subtext="Отвечает на новые входящие сообщения", default=False),
-            Text(text="Проверить работу плагина", icon="msg_check", on_click=lambda _v: self._test_plugin()),
-            Text(text="Проверить Gemini API", icon="msg_check", on_click=lambda _v: self._test_api()),
-            Text(text="Диагностика входящих", icon="msg_info", on_click=lambda _v: self._show_diagnostics()),
-            Text(text="Канал автора", icon="msg_channel", on_click=lambda _v: self._open_author_channel()),
-            Text(text="? Как пользоваться", icon="msg_help", on_click=lambda _v: self._show_help()),
-            Divider(text="Gemini"),
-            Input(key="api_key", text="Gemini API key", default="", subtext="ключ хранится локально в настройках плагина"),
-            Selector(key="quality", text="Режим качества", items=["Экономный", "Рекомендуемый", "Усиленный"], default=1),
-            Input(key="model", text="Модель", default="auto", subtext="auto — выбирается доступная модель Gemini"),
-            EditText(key="prompt", hint="Системный промпт", default=DEFAULT_PROMPT, multiline=True, max_length=6000),
-            Divider(text="Автоответчик"),
-            Switch(key="private_only", text="Только личные сообщения", subtext="Без групп и каналов", default=True),
-            Switch(key="reply_to_groups", text="Отвечать в группах", subtext="Работает только если отключён режим «только личные сообщения»", default=False),
-            Input(key="delay_min", text="Минимальная задержка, сек", default="2"),
-            Input(key="delay_max", text="Максимальная задержка, сек", default="5"),
-            Input(key="cooldown", text="Пауза между автоответами, сек", default="0", subtext="0 — отвечать на каждое входящее сообщение"),
-            Input(key="context_count", text="Сообщений контекста", default="8"),
-            Divider(text="Расписание"),
-            Selector(key="schedule_mode", text="Когда отвечать", items=["Всегда", "По расписанию"], default=0),
-            Input(key="start_date", text="Дата начала", default="", subtext="YYYY-MM-DD; пусто — без ограничения"),
-            Input(key="end_date", text="Дата окончания", default="", subtext="YYYY-MM-DD; пусто — без ограничения"),
-            Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
-            Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
-            Divider(),
-            Text(text="AutoResp 1.0.9 • Gemini REST", subtext="Каждое принятое входящее сообщение получает отдельную задачу ответа"),
-        ]
+        return [Header(text="AutoResp — Gemini AI"),
+                Switch(key="enabled", text="Включить автоответчик", subtext="Отвечает на новые входящие сообщения", default=False),
+                Text(text="Проверить работу плагина", icon="msg_check", on_click=lambda _v: self._test_plugin()),
+                Text(text="Проверить Gemini API", icon="msg_check", on_click=lambda _v: self._test_api()),
+                Text(text="Диагностика входящих", icon="msg_info", on_click=lambda _v: self._show_diagnostics()),
+                Text(text="Канал автора", icon="msg_channel", on_click=lambda _v: self._open_author_channel()),
+                Text(text="? Как пользоваться", icon="msg_help", on_click=lambda _v: self._show_help()),
+                Divider(text="Gemini"),
+                Input(key="api_key", text="Gemini API key", default="", subtext="ключ хранится локально в настройках плагина"),
+                Selector(key="quality", text="Режим качества", items=["Экономный", "Рекомендуемый", "Усиленный"], default=1),
+                Input(key="model", text="Модель", default="auto", subtext="auto — выбирается доступная модель Gemini"),
+                EditText(key="prompt", hint="Системный промпт", default=DEFAULT_PROMPT, multiline=True, max_length=6000),
+                Divider(text="Автоответчик"),
+                Switch(key="private_only", text="Только личные сообщения", subtext="Без групп и каналов", default=True),
+                Switch(key="reply_to_groups", text="Отвечать в группах", subtext="Работает только если отключён режим «только личные сообщения»", default=False),
+                Input(key="delay_min", text="Минимальная задержка, сек", default="2"),
+                Input(key="delay_max", text="Максимальная задержка, сек", default="5"),
+                Input(key="cooldown", text="Пауза между автоответами, сек", default="0", subtext="0 — отвечать на каждое входящее сообщение"),
+                Input(key="context_count", text="Сообщений контекста", default="8"),
+                Divider(text="Расписание"),
+                Selector(key="schedule_mode", text="Когда отвечать", items=["Всегда", "По расписанию"], default=0),
+                Input(key="start_date", text="Дата начала", default="", subtext="YYYY-MM-DD; пусто — без ограничения"),
+                Input(key="end_date", text="Дата окончания", default="", subtext="YYYY-MM-DD; пусто — без ограничения"),
+                Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
+                Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
+                Divider(),
+                Text(text="AutoResp 1.0.9 • Gemini REST", subtext="Каждое принятое входящее сообщение получает отдельную задачу ответа")]
 
     def on_plugin_load(self):
         for name in ("TL_updateNewMessage", "TL_updateNewChannelMessage", "TL_updateShortMessage", "TL_updateShortChatMessage"):
@@ -95,6 +85,15 @@ class AutoRespPlugin(BasePlugin):
             fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
             if activity: activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(AUTHOR_CHANNEL)))
         except Exception: self.logger.exception("Failed to open author channel")
+
+    def _dialog(self, title: str, message: str):
+        def show():
+            try:
+                fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
+                if not activity: return
+                builder = AlertDialogBuilder(activity); builder.set_title(title); builder.set_message(message); builder.set_positive_button("ок", lambda b, w: b.dismiss()); builder.show()
+            except Exception: self.logger.exception("Failed to show dialog")
+        run_on_ui_thread(show)
 
     def _test_plugin(self):
         api_key = str(self.get_setting("api_key", "") or "").strip()
@@ -122,15 +121,6 @@ class AutoRespPlugin(BasePlugin):
     def _show_diagnostics(self):
         with self._lock: stats = dict(self._stats); pending = len(self._pending)
         self._dialog("Диагностика AutoResp", f"hook-событий: {stats['hooks']}\nвходящих принято: {stats['incoming']}\nпоставлено в очередь: {stats['queued']}\nответов отправлено: {stats['sent']}\nошибок: {stats['errors']}\nожидают обработки: {pending}\nпоследнее событие: {stats['last'] or 'нет'}")
-
-    def _dialog(self, title: str, message: str):
-        def show():
-            try:
-                fragment = get_last_fragment(); activity = fragment.getParentActivity() if fragment else None
-                if not activity: return
-                builder = AlertDialogBuilder(activity); builder.set_title(title); builder.set_message(message); builder.set_positive_button("ок", lambda b, w: b.dismiss()); builder.show()
-            except Exception: self.logger.exception("Failed to show dialog")
-        run_on_ui_thread(show)
 
     def _show_help(self):
         self._dialog("Как проверить AutoResp", "1. укажи Gemini API key.\n2. нажми «Проверить работу плагина».\n3. включи автоответчик.\n4. напиши на этот Telegram-аккаунт с другого аккаунта.\n5. AutoResp поставит входящее сообщение в очередь и ответит после задержки.\n\nпо умолчанию cooldown = 0, поэтому каждое принятое входящее сообщение получает свой ответ.\n\nисходящие сообщения самого аккаунта игнорируются. нужен интернет и запущенный exteraGram.\n\nканал автора: @rommy_apps")
