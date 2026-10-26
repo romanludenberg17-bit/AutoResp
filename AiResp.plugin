@@ -18,13 +18,13 @@ from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
 
 
 __id__ = "autoresp"
-__name__ = "AutoResp"
-__description__ = "AI-автоответчик для Telegram через Gemini API."
+__name__ = "AutoResp — Gemini AI"
+__description__ = "AI-автоответчик для Telegram через Gemini API. Личные сообщения по умолчанию, ограничение частоты ответов, задержка, контекст, расписание и настройка промпта."
 __author__ = "@h0nkey"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __icon__ = "exteraPlugins/1"
-__app_version__ = ">=12.5.1"
-__sdk_version__ = ">=1.4.5.0"
+__app_version__ = ">=12.10.6"
+__sdk_version__ = ">=1.4.4.3"
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -34,7 +34,7 @@ DEFAULT_PROMPT = (
     "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
     "не выдумывай факты обо мне. "
     "учитывай контекст предыдущих сообщений. "
-    "если сообщение не требует ответа, дай короткую вежливую реакцию."
+    "не отправляй рекламу, ссылки или массовые сообщения без явной причины."
 )
 
 QUALITY = {
@@ -50,20 +50,23 @@ class AutoRespPlugin(BasePlugin):
         self._busy: set[Tuple[int, int]] = set()
         self._seen: set[Tuple[int, int, int]] = set()
         self._context: Dict[Tuple[int, int], List[Tuple[str, str]]] = {}
+        self._latest: Dict[Tuple[int, int], int] = {}
+        self._pending: Dict[Tuple[int, int], Tuple[str, int]] = {}
+        self._last_reply: Dict[Tuple[int, int], float] = {}
         self._model_cache: Dict[str, Tuple[str, float]] = {}
         self._lock = threading.RLock()
 
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="AutoResp"),
+            Header(text="AutoResp — Gemini AI"),
             Switch(
                 key="enabled",
                 text="Включить автоответчик",
-                subtext="Отвечает на новые входящие сообщения",
+                subtext="Выключено по умолчанию; отвечает только на новые входящие сообщения",
                 default=False,
             ),
             Text(
-                text="? Как это работает",
+                text="? Как пользоваться",
                 icon="msg_help",
                 on_click=lambda _view: self._show_help(),
             ),
@@ -72,7 +75,7 @@ class AutoRespPlugin(BasePlugin):
                 key="api_key",
                 text="Gemini API key",
                 default="",
-                subtext="ключ хранится в настройках плагина и не попадает в GitHub",
+                subtext="ключ хранится локально в настройках плагина и не публикуется",
             ),
             Selector(
                 key="quality",
@@ -84,7 +87,7 @@ class AutoRespPlugin(BasePlugin):
                 key="model",
                 text="Модель",
                 default="auto",
-                subtext="auto — плагин сам выберет подходящую модель",
+                subtext="auto — плагин выбирает доступную text-модель через API",
             ),
             EditText(
                 key="prompt",
@@ -102,17 +105,23 @@ class AutoRespPlugin(BasePlugin):
             Switch(
                 key="private_only",
                 text="Только личные сообщения",
-                subtext="Группы и каналы игнорируются",
+                subtext="Рекомендуемый безопасный режим; группы и каналы не затрагиваются",
                 default=True,
             ),
             Switch(
                 key="reply_to_groups",
                 text="Отвечать в группах",
-                subtext="Работает только если выключен режим «только личные»",
+                subtext="Не действует при включённом режиме «только личные сообщения»; каналы всегда игнорируются",
                 default=False,
             ),
             Input(key="delay_min", text="Минимальная задержка, сек", default="2"),
             Input(key="delay_max", text="Максимальная задержка, сек", default="5"),
+            Input(
+                key="cooldown",
+                text="Пауза между автоответами, сек",
+                default="60",
+                subtext="Защита от серии автоматических сообщений; 0 отключает паузу",
+            ),
             Input(key="context_count", text="Сообщений контекста", default="8"),
             Divider(text="Расписание"),
             Selector(
@@ -137,33 +146,30 @@ class AutoRespPlugin(BasePlugin):
             Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
             Divider(),
             Text(
-                text="AutoResp 1.0.2 • Gemini REST • без собственного сервера",
-                subtext="API-запросы выполняются прямо с телефона",
+                text="AutoResp 1.0.3 • Gemini REST • без собственного сервера",
+                subtext="Нет фоновой рассылки, автоподписок, загрузки дополнений или автообновления кода",
             ),
         ]
 
     def on_plugin_load(self):
         self.add_hook("TL_updateNewMessage")
         self.add_hook("TL_updateNewChannelMessage")
-        self.add_hook("TL_updateNewScheduledMessage")
-        self.log("AutoResp loaded")
+        self.log("AutoResp 1.0.3 loaded")
 
     def on_plugin_unload(self):
         with self._lock:
             self._busy.clear()
             self._seen.clear()
             self._context.clear()
+            self._latest.clear()
+            self._pending.clear()
+            self._last_reply.clear()
             self._model_cache.clear()
         self.log("AutoResp unloaded")
 
     def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
-        if update_name not in (
-            "TL_updateNewMessage",
-            "TL_updateNewChannelMessage",
-            "TL_updateNewScheduledMessage",
-        ):
+        if update_name not in ("TL_updateNewMessage", "TL_updateNewChannelMessage"):
             return HookResult()
-
         if not self.get_setting("enabled", False):
             return HookResult()
 
@@ -181,33 +187,41 @@ class AutoRespPlugin(BasePlugin):
         dialog_id = self._dialog_id(message)
         if dialog_id is None or message_id == 0:
             return HookResult()
-
-        seen_key = (int(account), int(dialog_id), message_id)
-        with self._lock:
-            if seen_key in self._seen:
-                return HookResult()
-            self._seen.add(seen_key)
-            if len(self._seen) > 4000:
-                self._seen = set(list(self._seen)[-2000:])
-
         if not self._allowed_dialog(dialog_id):
             return HookResult()
         if not self._schedule_allowed():
             return HookResult()
 
-        self._remember(account, dialog_id, "user", text)
+        seen_key = (int(account), int(dialog_id), message_id)
         key = (int(account), int(dialog_id))
+        now = time.time()
+
         with self._lock:
+            if seen_key in self._seen:
+                return HookResult()
+            self._seen.add(seen_key)
+            self._latest[key] = message_id
+            if len(self._seen) > 4000:
+                self._seen = set(list(self._seen)[-2000:])
+
+            cooldown = self._int_setting("cooldown", 60, 0, 86400)
+            last_reply = self._last_reply.get(key, 0.0)
+            if cooldown and now - last_reply < cooldown:
+                self.log(f"Cooldown active for dialog={dialog_id}")
+                return HookResult()
+
             if key in self._busy:
+                self._pending[key] = (text.strip(), message_id)
                 return HookResult()
             self._busy.add(key)
 
+        self._remember(account, dialog_id, "user", text)
         delay = self._delay_seconds()
         run_on_queue(
             lambda: self._generate_and_reply(
                 account=account,
                 dialog_id=dialog_id,
-                incoming=text,
+                incoming=text.strip(),
                 message_id=message_id,
             ),
             EXTERNAL_NETWORK_QUEUE,
@@ -227,14 +241,10 @@ class AutoRespPlugin(BasePlugin):
             if not model:
                 raise RuntimeError("Не удалось подобрать модель Gemini")
 
-            quality = QUALITY.get(
-                int(self.get_setting("quality", 1) or 1), QUALITY[1]
-            )
+            quality = QUALITY.get(int(self.get_setting("quality", 1) or 1), QUALITY[1])
             context_count = self._int_setting("context_count", 8, 1, 20)
             history = self._get_context(account, dialog_id, context_count)
-            system_prompt = str(
-                self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT
-            ).strip()
+            system_prompt = str(self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT).strip()
 
             history_text = []
             for role, item_text in history:
@@ -260,10 +270,7 @@ class AutoRespPlugin(BasePlugin):
 
             response = requests.post(
                 f"{GEMINI_BASE}/{model}:generateContent",
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                 json=payload,
                 timeout=45,
             )
@@ -279,18 +286,48 @@ class AutoRespPlugin(BasePlugin):
                 answer = answer[:4093].rstrip() + "..."
 
             if not self._still_latest(account, dialog_id, message_id):
+                self.log(f"Skipped stale response for dialog={dialog_id}")
                 return
+
+            cooldown = self._int_setting("cooldown", 60, 0, 86400)
+            with self._lock:
+                last_reply = self._last_reply.get(key, 0.0)
+                if cooldown and time.time() - last_reply < cooldown:
+                    return
 
             send_text(dialog_id, answer, account=account)
             self._remember(account, dialog_id, "assistant", answer)
-            self.log(
-                f"Auto reply sent: account={account} dialog={dialog_id} model={model}"
-            )
+            with self._lock:
+                self._last_reply[key] = time.time()
+            self.log(f"Auto reply sent: account={account} dialog={dialog_id} model={model}")
         except Exception as exc:
             self.log(f"AutoResp generation failed: {exc!r}")
         finally:
+            pending = None
             with self._lock:
                 self._busy.discard(key)
+                pending = self._pending.pop(key, None)
+
+            if pending and self.get_setting("enabled", False):
+                pending_text, pending_id = pending
+                if self._still_latest(account, dialog_id, pending_id):
+                    with self._lock:
+                        cooldown = self._int_setting("cooldown", 60, 0, 86400)
+                        last_reply = self._last_reply.get(key, 0.0)
+                        if cooldown and time.time() - last_reply < cooldown:
+                            return
+                        self._busy.add(key)
+                    delay = self._delay_seconds()
+                    run_on_queue(
+                        lambda: self._generate_and_reply(
+                            account=account,
+                            dialog_id=dialog_id,
+                            incoming=pending_text,
+                            message_id=pending_id,
+                        ),
+                        EXTERNAL_NETWORK_QUEUE,
+                        int(delay * 1000),
+                    )
 
     def _resolve_model(self, api_key: str) -> Optional[str]:
         manual = str(self.get_setting("model", "auto") or "auto").strip()
@@ -349,9 +386,11 @@ class AutoRespPlugin(BasePlugin):
         is_private = dialog_id > 0
         if private_only:
             return is_private
-        if not is_private and not bool(self.get_setting("reply_to_groups", False)):
-            return False
-        return True
+        if is_private:
+            return True
+        if bool(self.get_setting("reply_to_groups", False)):
+            return -1000000000000 < dialog_id < 0
+        return False
 
     def _schedule_allowed(self) -> bool:
         if int(self.get_setting("schedule_mode", 0) or 0) == 0:
@@ -419,7 +458,7 @@ class AutoRespPlugin(BasePlugin):
 
     def _still_latest(self, account: int, dialog_id: int, message_id: int) -> bool:
         with self._lock:
-            return (int(account), int(dialog_id), int(message_id)) in self._seen
+            return self._latest.get((int(account), int(dialog_id))) == int(message_id)
 
     def _delay_seconds(self) -> float:
         minimum = self._int_setting("delay_min", 2, 0, 300)
@@ -439,7 +478,11 @@ class AutoRespPlugin(BasePlugin):
     def _parse_time(value: str) -> Optional[dt.time]:
         try:
             hour, minute = value.strip().split(":", 1)
-            return dt.time(int(hour), int(minute))
+            hour = int(hour)
+            minute = int(minute)
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+            return dt.time(hour, minute)
         except Exception:
             return None
 
@@ -477,19 +520,20 @@ class AutoRespPlugin(BasePlugin):
             if not activity:
                 return
             builder = AlertDialogBuilder(activity)
-            builder.set_title("AutoResp")
+            builder.set_title("AutoResp — Gemini AI")
             builder.set_message(
                 "1. включи автоответчик.\n"
-                "2. создай Gemini API key в Google AI Studio и вставь его в поле Gemini API key.\n"
+                "2. создай Gemini API key в Google AI Studio и вставь его в настройки.\n"
                 "3. выбери качество или оставь «Рекомендуемый».\n"
-                "4. модель «auto» подбирается автоматически.\n"
-                "5. задай свой системный промпт.\n"
-                "6. установи задержку и, если нужно, расписание.\n\n"
-                "API-запросы идут напрямую с телефона в Gemini. "
-                "ключ не записывается в этот репозиторий."
+                "4. модель «auto» подбирается через официальный список доступных моделей API.\n"
+                "5. задай системный промпт, задержку и при необходимости расписание.\n"
+                "6. по умолчанию обрабатываются только личные сообщения.\n\n"
+                "плагин не делает массовых рассылок, не подписывает на каналы, не загружает код и не обновляет себя.\n"
+                "запросы к Gemini выполняются напрямую с телефона."
             )
             builder.set_positive_button("Понятно", lambda b, _w: b.dismiss())
             builder.show()
+
         run_on_ui_thread(show)
 
     def _test_api(self):
@@ -506,10 +550,7 @@ class AutoRespPlugin(BasePlugin):
                     raise RuntimeError("Подходящая модель не найдена")
                 response = requests.post(
                     f"{GEMINI_BASE}/{model}:generateContent",
-                    headers={
-                        "x-goog-api-key": api_key,
-                        "Content-Type": "application/json",
-                    },
+                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                     json={
                         "contents": [
                             {"role": "user", "parts": [{"text": "ответь одним словом: ok"}]}
@@ -525,9 +566,7 @@ class AutoRespPlugin(BasePlugin):
                 text = self._extract_text(response.json()).strip()
                 if not text:
                     raise RuntimeError("API не вернул текст")
-                run_on_ui_thread(
-                    lambda: BulletinHelper.show_success(f"Gemini работает • {model}")
-                )
+                run_on_ui_thread(lambda: BulletinHelper.show_success(f"Gemini работает • {model}"))
             except Exception as exc:
                 self.log(f"Gemini test failed: {exc!r}")
                 message = str(exc)[:240]
