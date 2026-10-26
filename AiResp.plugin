@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,15 +19,15 @@ from ui.settings import Divider, EditText, Header, Input, Selector, Switch, Text
 
 __id__ = "autoresp"
 __name__ = "AutoResp"
-__description__ = "AI-автоответчик для личных сообщений через Gemini API."
+__description__ = "AI-автоответчик для Telegram через Gemini API."
 __author__ = "romanludenberg17-bit"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.0"
 
-
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 DEFAULT_PROMPT = (
     "ты — мой личный автоответчик в Telegram. "
     "отвечай естественно, коротко и по-человечески. "
@@ -109,21 +111,9 @@ class AutoRespPlugin(BasePlugin):
                 subtext="Работает только если выключен режим «только личные»",
                 default=False,
             ),
-            Input(
-                key="delay_min",
-                text="Минимальная задержка, сек",
-                default="2",
-            ),
-            Input(
-                key="delay_max",
-                text="Максимальная задержка, сек",
-                default="5",
-            ),
-            Input(
-                key="context_count",
-                text="Сообщений контекста",
-                default="8",
-            ),
+            Input(key="delay_min", text="Минимальная задержка, сек", default="2"),
+            Input(key="delay_max", text="Максимальная задержка, сек", default="5"),
+            Input(key="context_count", text="Сообщений контекста", default="8"),
             Divider(text="Расписание"),
             Selector(
                 key="schedule_mode",
@@ -143,21 +133,11 @@ class AutoRespPlugin(BasePlugin):
                 default="",
                 subtext="YYYY-MM-DD; пусто — без ограничения",
             ),
-            Input(
-                key="start_time",
-                text="Время начала",
-                default="00:00",
-                subtext="HH:MM",
-            ),
-            Input(
-                key="end_time",
-                text="Время окончания",
-                default="23:59",
-                subtext="HH:MM",
-            ),
+            Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
+            Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
             Divider(),
             Text(
-                text="AutoResp 1.0.0 • Gemini REST • без собственного сервера",
+                text="AutoResp 1.0.1 • Gemini REST • без собственного сервера",
                 subtext="API-запросы выполняются прямо с телефона",
             ),
         ]
@@ -166,7 +146,7 @@ class AutoRespPlugin(BasePlugin):
         self.add_hook("TL_updateNewMessage")
         self.add_hook("TL_updateNewChannelMessage")
         self.add_hook("TL_updateNewScheduledMessage")
-        self.logger.info("AutoResp loaded")
+        self.log("AutoResp loaded")
 
     def on_plugin_unload(self):
         with self._lock:
@@ -174,11 +154,9 @@ class AutoRespPlugin(BasePlugin):
             self._seen.clear()
             self._context.clear()
             self._model_cache.clear()
-        self.logger.info("AutoResp unloaded")
+        self.log("AutoResp unloaded")
 
-    def on_update_hook(
-        self, update_name: str, account: int, update: Any
-    ) -> HookResult:
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
         if update_name not in (
             "TL_updateNewMessage",
             "TL_updateNewChannelMessage",
@@ -196,7 +174,6 @@ class AutoRespPlugin(BasePlugin):
         text = getattr(message, "message", None)
         if not isinstance(text, str) or not text.strip():
             return HookResult()
-
         if bool(getattr(message, "out", False)):
             return HookResult()
 
@@ -213,21 +190,19 @@ class AutoRespPlugin(BasePlugin):
             if len(self._seen) > 4000:
                 self._seen = set(list(self._seen)[-2000:])
 
-        if not self._allowed_dialog(dialog_id, message):
+        if not self._allowed_dialog(dialog_id):
             return HookResult()
-
         if not self._schedule_allowed():
             return HookResult()
 
         self._remember(account, dialog_id, "user", text)
-
-        delay = self._delay_seconds()
         key = (int(account), int(dialog_id))
         with self._lock:
             if key in self._busy:
                 return HookResult()
             self._busy.add(key)
 
+        delay = self._delay_seconds()
         run_on_queue(
             lambda: self._generate_and_reply(
                 account=account,
@@ -240,26 +215,21 @@ class AutoRespPlugin(BasePlugin):
         )
         return HookResult()
 
-    def _generate_and_reply(
-        self,
-        account: int,
-        dialog_id: int,
-        incoming: str,
-        message_id: int,
-    ):
+    def _generate_and_reply(self, account: int, dialog_id: int, incoming: str, message_id: int):
         key = (int(account), int(dialog_id))
         try:
             api_key = str(self.get_setting("api_key", "") or "").strip()
             if not api_key:
-                self.logger.warning("Gemini API key is empty")
+                self.log("Gemini API key is empty")
                 return
 
             model = self._resolve_model(api_key)
             if not model:
                 raise RuntimeError("Не удалось подобрать модель Gemini")
 
-            quality_index = int(self.get_setting("quality", 1) or 1)
-            quality = QUALITY.get(quality_index, QUALITY[1])
+            quality = QUALITY.get(
+                int(self.get_setting("quality", 1) or 1), QUALITY[1]
+            )
             context_count = self._int_setting("context_count", 8, 1, 20)
             history = self._get_context(account, dialog_id, context_count)
             system_prompt = str(
@@ -299,8 +269,7 @@ class AutoRespPlugin(BasePlugin):
             )
             if response.status_code != 200:
                 raise RuntimeError(
-                    f"Gemini HTTP {response.status_code}: "
-                    f"{self._short_error(response.text)}"
+                    f"Gemini HTTP {response.status_code}: {self._short_error(response.text)}"
                 )
 
             answer = self._extract_text(response.json()).strip()
@@ -314,14 +283,11 @@ class AutoRespPlugin(BasePlugin):
 
             send_text(dialog_id, answer, account=account)
             self._remember(account, dialog_id, "assistant", answer)
-            self.logger.info(
-                "Auto reply sent: account=%s dialog=%s model=%s",
-                account,
-                dialog_id,
-                model,
+            self.log(
+                f"Auto reply sent: account={account} dialog={dialog_id} model={model}"
             )
-        except Exception:
-            self.logger.exception("AutoResp generation failed")
+        except Exception as exc:
+            self.log(f"AutoResp generation failed: {exc!r}")
         finally:
             with self._lock:
                 self._busy.discard(key)
@@ -375,10 +341,10 @@ class AutoRespPlugin(BasePlugin):
 
         selected = sorted(candidates, key=score)[0]
         self._model_cache["auto"] = (selected, now + 1800)
-        self.logger.info("Auto-selected Gemini model: %s", selected)
+        self.log(f"Auto-selected Gemini model: {selected}")
         return selected
 
-    def _allowed_dialog(self, dialog_id: int, message: Any) -> bool:
+    def _allowed_dialog(self, dialog_id: int) -> bool:
         private_only = bool(self.get_setting("private_only", True))
         is_private = dialog_id > 0
         if private_only:
@@ -434,6 +400,7 @@ class AutoRespPlugin(BasePlugin):
                 return int(value)
             except Exception:
                 pass
+
         peer = getattr(message, "peer_id", None)
         if peer is None:
             return None
@@ -461,7 +428,6 @@ class AutoRespPlugin(BasePlugin):
         maximum = self._int_setting("delay_max", 5, minimum, 300)
         if maximum <= minimum:
             return float(minimum)
-        import random
         return random.uniform(minimum, maximum)
 
     def _int_setting(self, key: str, default: int, minimum: int, maximum: int) -> int:
@@ -495,7 +461,7 @@ class AutoRespPlugin(BasePlugin):
     @staticmethod
     def _short_error(text: str) -> str:
         try:
-            data = __import__("json").loads(text)
+            data = json.loads(text)
             message = data.get("error", {}).get("message")
             if message:
                 return str(message)[:300]
@@ -526,6 +492,7 @@ class AutoRespPlugin(BasePlugin):
             )
             builder.set_positive_button("Понятно", lambda b, _w: b.dismiss())
             builder.show()
+
         run_on_ui_thread(show)
 
     def _test_api(self):
@@ -533,6 +500,7 @@ class AutoRespPlugin(BasePlugin):
         if not api_key:
             BulletinHelper.show_error("Сначала укажи Gemini API key")
             return
+
         BulletinHelper.show_info("Проверяю Gemini API…")
 
         def task():
@@ -548,7 +516,10 @@ class AutoRespPlugin(BasePlugin):
                     },
                     json={
                         "contents": [
-                            {"role": "user", "parts": [{"text": "ответь одним словом: ok"}]}
+                            {
+                                "role": "user",
+                                "parts": [{"text": "ответь одним словом: ok"}],
+                            }
                         ],
                         "generationConfig": {"maxOutputTokens": 8},
                     },
@@ -565,7 +536,7 @@ class AutoRespPlugin(BasePlugin):
                     lambda: BulletinHelper.show_success(f"Gemini работает • {model}")
                 )
             except Exception as exc:
-                self.logger.exception("Gemini test failed")
+                self.log(f"Gemini test failed: {exc!r}")
                 message = str(exc)[:240]
                 run_on_ui_thread(lambda: BulletinHelper.show_error(message))
 
