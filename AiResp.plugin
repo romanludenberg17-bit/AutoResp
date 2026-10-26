@@ -226,6 +226,8 @@ class AutoRespPlugin(BasePlugin):
             system_prompt = str(self.get_setting("prompt", DEFAULT_PROMPT) or DEFAULT_PROMPT).strip()
             payload = {"systemInstruction": {"parts": [{"text": system_prompt}]}, "contents": [{"role": "user", "parts": [{"text": "контекст:\n" + (history_text or "(нет контекста)") + "\n\nпоследнее сообщение:\n" + incoming}]}], "generationConfig": {"temperature": quality["temperature"], "maxOutputTokens": quality["tokens"]}}
             response = self._gemini_post(base, model, api_key, payload)
+            if response is None:
+                raise RuntimeError("Gemini не вернул HTTP-ответ после повторных попыток")
             if response.status_code != 200:
                 raise RuntimeError(f"Gemini HTTP {response.status_code}: {self._short_error(response.text)}")
             answer = self._extract_text(response.json()).strip()
@@ -285,15 +287,13 @@ class AutoRespPlugin(BasePlugin):
                 r = requests.post(f"{base}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
                 if r.status_code == 404 and base == GEMINI_BASES[0]:
                     r2 = requests.post(f"{GEMINI_BASES[1]}/models/{model}:generateContent", headers=headers, json=payload, timeout=45)
-                    if r2.status_code != 404:
-                        return r2
-                    r = r2
+                    r = r2 if r2.status_code != 404 else r
                 if r.status_code not in (408, 429, 500, 502, 503, 504):
                     return r
                 last = r
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
-            except requests.RequestException as exc:
+            except requests.RequestException:
                 if attempt == 2:
                     raise
                 time.sleep(1.5 * (attempt + 1))
@@ -328,7 +328,7 @@ class AutoRespPlugin(BasePlugin):
         return None
 
     def _allowed_dialog(self, dialog_id: int) -> bool:
-        if bool(self.get_setting("private_only", True):
+        if bool(self.get_setting("private_only", True)):
             return dialog_id > 0
         if dialog_id > 0:
             return True
