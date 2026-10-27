@@ -1,3 +1,0 @@
-# Provider support
-
-Branch marker.
