@@ -18,9 +18,9 @@ from android.net import Uri
 
 __id__ = "autoresp"
 __name__ = "AutoResp — AI"
-__description__ = "AI-автоответчик exteraGram с автоматическим переключением Gemini, Groq и OpenRouter при сбоях API."
+__description__ = "AI-автоответчик exteraGram с поддержкой Gemini, Groq и OpenRouter, автоматическим fallback, проверкой API и понятной диагностикой."
 __author__ = "@h0nkey"
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.10.6"
 __sdk_version__ = ">=1.4.5.0"
@@ -28,6 +28,7 @@ __sdk_version__ = ">=1.4.5.0"
 GEMINI_BASES = ("https://generativelanguage.googleapis.com/v1beta", "https://generativelanguage.googleapis.com/v1")
 OPENAI_BASES = {"groq": "https://api.groq.com/openai/v1", "openrouter": "https://openrouter.ai/api/v1"}
 PROVIDERS = ("gemini", "groq", "openrouter")
+PROVIDER_NAMES = {"gemini": "Gemini", "groq": "Groq", "openrouter": "OpenRouter"}
 AUTHOR_CHANNEL = "https://t.me/rommy_apps"
 DEFAULT_PROMPT = ("ты — мой личный автоответчик в Telegram. отвечай естественно, коротко и по-человечески. "
                   "не говори, что ты бот или ИИ, если тебя прямо об этом не спрашивают. "
@@ -56,20 +57,20 @@ class AutoRespPlugin(BasePlugin):
     def create_settings(self) -> List[Any]:
         return [
             Header(text="AutoResp — AI"),
-            Switch(key="enabled", text="Включить автоответчик", subtext="Отвечает только в открытом сейчас чате", default=False),
-            Switch(key="fallback_enabled", text="Автопереключение AI", subtext="Если текущий API не отвечает — пробовать следующий", default=True),
+            Switch(key="enabled", text="Включить автоответчик", subtext="Не отвечает, если ты уже находишься в этом чате", default=False),
+            Switch(key="fallback_enabled", text="Автопереключение AI", subtext="Если один API не отвечает — автоматически пробовать следующий", default=True),
             Switch(key="fast_mode", text="Максимальная скорость", subtext="Без искусственной задержки", default=True),
             Text(text="Проверить работу плагина", icon="msg_check", on_click=lambda _v: self._test_plugin()),
-            Text(text="Проверить API", icon="msg_check", on_click=lambda _v: self._test_api()),
+            Text(text="Проверить все API", icon="msg_check", on_click=lambda _v: self._test_api()),
             Text(text="Диагностика", icon="msg_info", on_click=lambda _v: self._show_diagnostics()),
             Text(text="Канал автора", icon="msg_channel", on_click=lambda _v: self._open_author_channel()),
             Text(text="? Как пользоваться", icon="msg_help", on_click=lambda _v: self._show_help()),
             Divider(text="Провайдеры AI"),
             Selector(key="provider", text="Основной AI-провайдер", items=["Gemini", "Groq", "OpenRouter"], default=0),
-            Input(key="api_key", text="Gemini API key", default="", subtext="для Gemini"),
-            Input(key="groq_api_key", text="Groq API key", default="", subtext="для Groq"),
-            Input(key="openrouter_api_key", text="OpenRouter API key", default="", subtext="для OpenRouter"),
-            Input(key="model", text="Модель", default="auto", subtext="auto — подобрать доступную модель"),
+            Input(key="api_key", text="Gemini API key", default="", subtext="Ключ для Gemini"),
+            Input(key="groq_api_key", text="Groq API key", default="", subtext="Ключ для Groq"),
+            Input(key="openrouter_api_key", text="OpenRouter API key", default="", subtext="Ключ для OpenRouter"),
+            Input(key="model", text="Модель", default="auto", subtext="auto — подобрать доступную модель автоматически"),
             Selector(key="quality", text="Режим качества", items=["Экономный", "Рекомендуемый", "Усиленный"], default=1),
             EditText(key="prompt", hint="Системный промпт", default=DEFAULT_PROMPT, multiline=True, max_length=6000),
             Divider(text="Автоответчик"),
@@ -85,7 +86,7 @@ class AutoRespPlugin(BasePlugin):
             Input(key="end_date", text="Дата окончания", default="", subtext="YYYY-MM-DD"),
             Input(key="start_time", text="Время начала", default="00:00", subtext="HH:MM"),
             Input(key="end_time", text="Время окончания", default="23:59", subtext="HH:MM"),
-            Divider(), Text(text="AutoResp 1.4.0 • AI fallback", subtext="Gemini → Groq → OpenRouter при сбое")
+            Divider(), Text(text="AutoResp 1.4.1 • Gemini + Groq + OpenRouter", subtext="Fallback, проверка всех API и понятные отчёты")
         ]
 
     def on_plugin_load(self):
@@ -99,7 +100,7 @@ class AutoRespPlugin(BasePlugin):
         for name in ("TL_updates", "TL_updatesCombined"):
             try: self.add_hook(name)
             except Exception: pass
-        self.logger.info("AutoResp 1.4.0 loaded")
+        self.logger.info("AutoResp 1.4.1 loaded")
 
     def on_plugin_unload(self):
         self._loaded = False
@@ -172,7 +173,7 @@ class AutoRespPlugin(BasePlugin):
         getter = getattr(message, "getDialogId", None)
         if callable(getter):
             try:
-                value = int(getter());
+                value = int(getter())
                 if value: return value
             except Exception: pass
         peer = getattr(message, "peer_id", None) or getattr(message, "peerId", None)
@@ -220,7 +221,7 @@ class AutoRespPlugin(BasePlugin):
     def _accept_message(self, account: int, dialog_id: int, message_id: int, text: str, is_group: bool):
         current = self._current_open_dialog(account)
         with self._lock: self._stats["last_current_dialog"] = str(current or 0)
-        if current != int(dialog_id): return self._skip("chat_not_open")
+        if current == int(dialog_id): return self._skip("chat_open_user_present")
         key = (int(account), int(dialog_id), int(message_id)); now = time.time()
         with self._lock:
             if key in self._seen or key in self._pending: return self._skip("duplicate")
@@ -246,10 +247,10 @@ class AutoRespPlugin(BasePlugin):
 
     def _worker(self, account: int, dialog_id: int, text: str, key, is_group: bool):
         try:
-            if self._current_open_dialog(account) != int(dialog_id): return self._skip("chat_changed_before_ai")
+            if self._current_open_dialog(account) == int(dialog_id): return self._skip("chat_open_before_ai")
             answer, provider = self._generate_with_fallback(text, self._get_context(account, dialog_id), is_group)
             if not answer: return self._record_error("all AI providers failed")
-            if self._current_open_dialog(account) != int(dialog_id): return self._skip("chat_changed_before_send")
+            if self._current_open_dialog(account) == int(dialog_id): return self._skip("chat_open_before_send")
             send_text(dialog_id, answer[:4096], account=account)
             with self._lock:
                 self._last_reply[(account, dialog_id)] = time.time(); self._stats["sent"] += 1; self._stats["last_provider"] = provider
@@ -290,8 +291,7 @@ class AutoRespPlugin(BasePlugin):
                 errors.append(provider + ": временно заблокирован после 429"); continue
             try:
                 answer = self._generate(provider, key, text, context, is_group)
-                if answer.strip():
-                    return answer.strip(), provider
+                if answer.strip(): return answer.strip(), provider
                 errors.append(provider + ": пустой ответ")
             except Exception as exc:
                 errors.append(provider + ": " + str(exc)[:180])
@@ -314,8 +314,7 @@ class AutoRespPlugin(BasePlugin):
         model = self._resolve_model(provider, api_key)
         if provider == "gemini":
             payload = {"systemInstruction": {"parts": [{"text": prompt}]}, "contents": [{"role": "user", "parts": [{"text": user_text}]}], "generationConfig": {"temperature": q["temperature"], "maxOutputTokens": q["tokens"]}}
-            response = None
-            last = ""
+            response = None; last = ""
             for base in GEMINI_BASES:
                 try:
                     response = requests.post(f"{base}/models/{model}:generateContent", params={"key": api_key}, json=payload, timeout=35)
@@ -412,33 +411,92 @@ class AutoRespPlugin(BasePlugin):
     def _skip(self, reason):
         with self._lock: self._stats["last_skip"] = str(reason)[:200]
 
-    def _test_plugin(self): self._test_api(True)
+    def _friendly_error(self, provider, exc):
+        text = self._short_error(exc).lower()
+        name = PROVIDER_NAMES.get(provider, provider)
+        if "429" in text or "quota" in text or "rate limit" in text:
+            return f"{name}: лимит запросов или временное ограничение."
+        if "401" in text or "403" in text or "unauthorized" in text or "forbidden" in text or "invalid api" in text:
+            return f"{name}: API key не принят. Проверь ключ."
+        if "timeout" in text or "timed out" in text:
+            return f"{name}: сервер не ответил вовремя."
+        if "network" in text or "connection" in text or "dns" in text:
+            return f"{name}: нет соединения с сервером."
+        if "model" in text:
+            return f"{name}: не удалось найти доступную модель."
+        return f"{name}: API не прошёл проверку."
 
-    def _test_api(self, generate=False):
-        chain = self._provider_chain()
-        if not any(self._api_key(p) for p in chain): return self._dialog("Проверка API", "Не указан ни один API key.")
-        self._submit(lambda: self._test_worker(chain, generate), (0, 0, int(time.time() * 1000)))
+    def _test_plugin(self):
+        chain = list(PROVIDERS)
+        self._submit(lambda: self._test_plugin_worker(chain), (0, 1, int(time.time() * 1000)))
 
-    def _test_worker(self, chain, generate):
-        errors = []
-        for provider in chain:
-            key = self._api_key(provider)
-            if not key: continue
+    def _test_api(self):
+        chain = list(PROVIDERS)
+        self._submit(lambda: self._test_api_worker(chain), (0, 2, int(time.time() * 1000)))
+
+    def _test_api_worker(self, providers):
+        lines = ["Проверка всех AI API", ""]
+        any_configured = False
+        for provider in providers:
+            name = PROVIDER_NAMES[provider]; key = self._api_key(provider)
+            if not key:
+                lines.append(f"⚪ {name}: не настроен — API key не указан")
+                continue
+            any_configured = True
             try:
                 model = self._resolve_model(provider, key)
-                if not generate: return self._dialog("Проверка API", f"{provider}: OK\nмодель: {model}")
-                answer = self._generate(provider, key, "проверка работы автоответчика", [], False)
-                return self._dialog("Проверка AutoResp", f"работает.\n\nпровайдер: {provider}\nмодель: {model}\nответ:\n{answer or 'пустой ответ'}")
-            except Exception as exc: errors.append(provider + ": " + str(exc)[:180])
-        self._dialog("Проверка API", "Все доступные AI-провайдеры не ответили:\n" + "\n".join(errors))
+                lines.append(f"🟢 {name}: работает\n   Модель: {model}")
+            except Exception as exc:
+                lines.append(f"🔴 {name}: {self._friendly_error(provider, exc)}")
+        if not any_configured: lines.append("\nДобавь хотя бы один API key в настройках AutoResp.")
+        else: lines.append("\nПроверка завершена. Ключи и технические ошибки не показываются в этом отчёте.")
+        self._dialog("Статус AI API", "\n".join(lines))
+
+    def _test_plugin_worker(self, providers):
+        lines = ["Проверка AutoResp", ""]
+        lines.append("🟢 Плагин загружен" if self._loaded else "🔴 Плагин не загружен")
+        lines.append("🟢 Фоновый обработчик готов" if self._executor is not None else "🔴 Фоновый обработчик недоступен")
+        configured = [p for p in providers if self._api_key(p)]
+        if not configured:
+            lines.append("🔴 AI не настроен: нет ни одного API key")
+            return self._dialog("Проверка AutoResp", "\n".join(lines) + "\n\nОткрой настройки и добавь ключ Gemini, Groq или OpenRouter.")
+        lines.append("")
+        lines.append("Проверка API:")
+        working = []
+        for provider in providers:
+            key = self._api_key(provider)
+            name = PROVIDER_NAMES[provider]
+            if not key:
+                lines.append(f"⚪ {name}: не настроен")
+                continue
+            try:
+                model = self._resolve_model(provider, key)
+                lines.append(f"🟢 {name}: доступен ({model})")
+                working.append((provider, key, model))
+            except Exception as exc:
+                lines.append(f"🔴 {name}: {self._friendly_error(provider, exc)}")
+        if not working:
+            lines.append("\n🔴 Проверка AI не пройдена. Добавь рабочий API key или проверь интернет.")
+            return self._dialog("Проверка AutoResp", "\n".join(lines))
+        provider, key, model = working[0]
+        try:
+            answer = self._generate(provider, key, "Проверка AutoResp. Ответь одним коротким словом: ОК", [], False)
+            if answer.strip():
+                lines.append(f"\n🟢 Тестовый запрос: успешно ({PROVIDER_NAMES[provider]})")
+                lines.append("\nПлагин готов к работе.")
+            else:
+                lines.append("\n🟡 API доступен, но не вернул ответ.")
+        except Exception as exc:
+            lines.append(f"\n🔴 Тестовый запрос не выполнен: {self._friendly_error(provider, exc)}")
+        self._dialog("Проверка AutoResp", "\n".join(lines))
 
     def _show_diagnostics(self):
         with self._lock: s = dict(self._stats); pending = len(self._pending)
-        blocked = ", ".join(p for p, until in self._quota_block.items() if until > time.time()) or "нет"
-        self._dialog("Диагностика AutoResp", f"основной: {self._provider()}\nцепочка: {' → '.join(self._provider_chain())}\nпоследний: {s['last_provider'] or 'нет'}\n429-блокировки: {blocked}\nвходящих: {s['messages']}\nпоставлено в AI: {s['queued']}\nотправлено: {s['sent']}\nошибок: {s['errors']}\nожидают: {pending}\nоткрытый dialog: {s['last_current_dialog'] or 'нет'}\nпоследний пропуск: {s['last_skip'] or 'нет'}\nпоследняя ошибка: {s['last_error'] or 'нет'}")
+        blocked = ", ".join(PROVIDER_NAMES.get(p, p) for p, until in self._quota_block.items() if until > time.time()) or "нет"
+        self._dialog("Диагностика AutoResp", f"основной: {PROVIDER_NAMES.get(self._provider(), self._provider())}\nцепочка: {' → '.join(PROVIDER_NAMES.get(p, p) for p in self._provider_chain())}\nпоследний AI: {PROVIDER_NAMES.get(s['last_provider'], s['last_provider']) or 'нет'}\n429-блокировки: {blocked}\nвходящих: {s['messages']}\nпоставлено в AI: {s['queued']}\nотправлено: {s['sent']}\nошибок: {s['errors']}\nожидают: {pending}\nоткрытый чат: {s['last_current_dialog'] or 'нет'}\nпоследний пропуск: {s['last_skip'] or 'нет'}")
 
     def _show_help(self):
-        self._dialog("Как пользоваться AutoResp", "Укажи ключи Gemini, Groq и/или OpenRouter. Выбери основной провайдер и оставь модель auto. Если основной AI не отвечает, выдаёт 429, сетевую ошибку или другой API-сбой, AutoResp автоматически пробует следующий провайдер с заданным ключом. Если один снова не работает — идёт дальше по цепочке. Ответ отправляется только в реально открытый чат.")
+        self._dialog("Как пользоваться AutoResp", "AutoResp поддерживает Gemini, Groq и OpenRouter. Добавь один или несколько API key, выбери основной AI и оставь модель auto. При сбое, лимите или сетевой ошибке AutoResp может автоматически перейти к следующему провайдеру. Кнопка «Проверить все API» показывает статус каждого ключа отдельно. «Проверить работу плагина» проверяет сам плагин, API и тестовый AI-запрос. Если ты уже находишься в чате с человеком, AutoResp не отвечает — он отвечает, когда этот чат не открыт.")
 
     def _open_author_channel(self):
         try:
